@@ -78,6 +78,11 @@ void vk::initVulkan() {
     createImageView();
     createRenderPass();
     createDescriptorSetLayout();
+    // 注意：此处创建管线的顺序并不等同于 GPU 在运行时的执行顺序。
+    // 我们在这里先创建计算管线再创建图形管线（这是允许的），但如果运行时希望计算着色器先执行
+    // 并向 SSBO 写入数据以供随后的图形着色器读取，则必须在命令缓冲中按顺序录制这些操作：
+    // 先执行 compute dispatch，随后做内存屏障（barrier），最后执行 render pass 和 draw。
+    // 请参考 `createCommandBuffers()` 中关于如何录制 compute -> barrier -> graphics 的注释示例。
     createComputePipeline();
     createGraphicsPipeline();
     createFrameBuffers();
@@ -505,6 +510,10 @@ void vk::createDescriptorSetLayout() {
     ssboLayoutBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT;
     ssboLayoutBinding.pImmutableSamplers = nullptr;
 
+    // 重要：此处的描述符绑定必须与 GLSL 着色器中使用的绑定一致（例如 UBO 用 layout(binding = 0)，
+    // SSBO 用 layout(binding = 1)）。如果绑定不匹配或内存布局（std140 与 std430）不同，
+    // 将导致着色器读取/写入错误，但不一定会产生明显的运行时错误。请确保 GLSL 与 C++ 的描述符布局保持一致。
+
     std::array<VkDescriptorSetLayoutBinding, 2> bindings = {uboLayoutBinding, ssboLayoutBinding};
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -518,8 +527,12 @@ void vk::createDescriptorSetLayout() {
 }
 
 void vk::createGraphicsPipeline() {
-    auto vertShaderCode = readFile("/home/neuroil/code/practice/Blackhole_prac/src/shader/spv/shader.vert.spv");
-    auto fragShaderCode = readFile("/home/neuroil/code/practice/Blackhole_prac/src/shader/spv/shader.frag.spv");
+    // 重要：readFile 使用相对路径。如果运行进程的工作目录为可执行文件目录（例如通过 IDE 运行或双击），
+    // 相对路径必须能够解析。为避免运行时找不到文件，我们在 CMake 中添加了 POST_BUILD 步骤，
+    // 将 SPV 文件复制到 "$<TARGET_FILE_DIR:main>/src/shader/"，以确保无论当前工作目录如何都能访问到
+    // "src\\shader\\vert.spv" 和 "src\\shader\\frag.spv"。
+    auto vertShaderCode = readFile("src\\shader\\vert.spv");
+    auto fragShaderCode = readFile("src\\shader\\frag.spv");
 
     VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
     VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
@@ -549,6 +562,15 @@ void vk::createGraphicsPipeline() {
     vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
     vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
     vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
+
+    // 注意：验证层可能会警告声明的顶点属性未被顶点着色器使用（在运行时出现过）。
+    // 这意味着在此处声明的 `attributeDescriptions`（location 0/1）在当前的 `shader.vert` 中没有对应的
+    // `layout(location=...) in` 变量。可以采用两种修复方式：
+    //  1) 如果顶点着色器使用硬编码的全屏三角（通过 gl_VertexIndex），则移除顶点输入描述（将计数设为 0），
+    //     因为不需要绑定顶点缓冲；
+    //  2) 如果要使用顶点缓冲，则在顶点着色器中声明并使用输入属性（例如
+    //     `layout(location=0) in vec2 inPos; layout(location=1) in vec3 inColor;`），并在 C++ 端绑定对应的顶点缓冲。
+    // 保持两侧一致以消除验证层警告并避免潜在的未定义行为。
 
     // 输入汇编
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
@@ -749,7 +771,9 @@ void vk::createCommandPool() {
 
 void vk::createComputePipeline() {
     // 专用于计算的管线
-    auto computeShaderCode = readFile("/home/neuroil/code/practice/Blackhole_prac/src/shader/spv/shader.comp.spv");
+    // 重要：计算着色器的 SPV 文件通过相对路径加载。CMake 的 POST_BUILD 拷贝步骤会确保该文件在可执行目录
+    // 的 `src/shader/` 下存在，从而在运行时可被找到。另一种可选做法是在运行时基于可执行文件的位置解析绝对路径。
+    auto computeShaderCode = readFile("src\\shader\\comp.spv");
     VkShaderModule computeShaderModule = createShaderModule(computeShaderCode);
 
     VkPipelineShaderStageCreateInfo computeShaderStageInfo{};
@@ -843,8 +867,10 @@ void vk::createUniformBuffers() {
 }
 
 void vk::createShaderStorageBuffers() {
-    const size_t width = 1920;
-    const size_t height = 1080;
+    // 待修复：原先此处宽高是硬编码的，这会在窗口大小变化时导致问题。建议使用 `swapChainImageExtent.width/height`
+    // 或者从 UBO 提供的值来确保 SSBO 大小与实际渲染分辨率一致。硬编码的值可能会浪费显存或导致着色器越界读取。
+    const size_t width = static_cast<size_t>(swapChainImageExtent.width);
+    const size_t height = static_cast<size_t>(swapChainImageExtent.height);
     const size_t elementCount = width * height;
     ssboSize = sizeof(PixelResult) * elementCount;
 
@@ -1022,6 +1048,13 @@ void vk::createDescriptorSets() {
 //     }
 // }
 void vk::createCommandBuffers() {
+    // 警告：当前代码将 commandBuffers 的大小设置为 MAX_FRAMES_IN_FLIGHT。随后在 `draw()` 中使用
+    // `commandBuffers[imageIndex]`，而 imageIndex 由 vkAcquireNextImageKHR 返回，其范围是 [0, swapChainImages.size())。
+    // 如果 swapChainImages.size() 与 MAX_FRAMES_IN_FLIGHT 不相等，会导致索引越界。常见的两种解决方案：
+    //  - 为每个交换链图像分配一个命令缓冲并针对对应的图像进行记录（将大小改为 swapChainImages.size()）；
+    //  - 保持每帧一个命令缓冲（与 MAX_FRAMES_IN_FLIGHT 对齐），在提交时使用 commandBuffers[currentFrame]
+    //   （而不是使用 imageIndex 做索引）。
+    // 请选择并统一一种策略以保证索引一致性。目前代码仍使用 MAX_FRAMES_IN_FLIGHT，但应修改以避免越界访问。
     commandBuffers.resize(MAX_FRAMES_IN_FLIGHT); // 建议与 In Flight 帧数对齐
 
     VkCommandBufferAllocateInfo allocateInfo{};
@@ -1043,6 +1076,23 @@ void vk::createCommandBuffers() {
             throw std::runtime_error("failed to begin recording command buffer!");
         }
 
+        // 如果希望运行一个 compute pass 来填充 SSBO，并让后续图形管线读取该 SSBO，
+        // 则应在开启 render pass 之前记录 compute dispatch。示例步骤（伪代码）：
+        //
+        // vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+        // vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout,
+        //                         0, 1, &descriptorSets[i], 0, nullptr);
+        // vkCmdDispatch(cmd, groupsX, groupsY, 1);
+        // // 使用内存屏障使 SSBO 的写入对随后顶点/片段着色器的读取可见
+        // VkMemoryBarrier memBarrier = {};
+        // memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        // memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        // memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        // vkCmdPipelineBarrier(cmd,
+        //                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        //                      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        //                      0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+
         // 配置 Render Pass 启动信息
         VkRenderPassBeginInfo renderPassInfo{};
         renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1061,6 +1111,9 @@ void vk::createCommandBuffers() {
 
             // 2. 绑定图形管线
         vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+        // 绑定描述符集 (UBO / SSBO)，确保着色器可以读取到我们在 CPU 端写入的缓冲数据
+        vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicPipelineLayout,
+                                0, 1, &descriptorSets[i], 0, nullptr);
         VkViewport viewport{};
         viewport.x = 0.0f;
         viewport.y = 0.0f;
@@ -1112,6 +1165,37 @@ void vk::createSyncObjects() {
     }
 }
 
+void vk::updateUniformBuffer(uint32_t currentImage) {
+    // 填充 UniformBufferObject（包括 positions 数组）
+    UniformBufferObject ubo{};
+
+    // 相机相关（示例值，可根据需求修改）
+    ubo.cameraPos = glm::vec3(0.0f, 0.0f, 2.0f); ubo._pad0 = 0.0f;
+    ubo.cameraDir = glm::vec3(0.0f, 0.0f, -1.0f); ubo._pad1 = 0.0f;
+    ubo.cameraUp  = glm::vec3(0.0f, 1.0f, 0.0f);  ubo._pad2 = 0.0f;
+    ubo.cameraRight = glm::vec3(1.0f, 0.0f, 0.0f); ubo._pad3 = 0.0f;
+
+    // 屏幕大小
+    ubo.screenSize = glm::vec2(static_cast<float>(swapChainImageExtent.width),
+                               static_cast<float>(swapChainImageExtent.height));
+    ubo._pad4 = glm::vec2(0.0f);
+
+    // 黑洞与物体（示例值）
+    ubo.blackholePos_1 = glm::vec3(0.0f); ubo.blackholeRadius_1 = 0.5f;
+    ubo.blackholePos_2 = glm::vec3(2.0f, 0.0f, 0.0f); ubo.blackholeRadius_2 = 0.7f;
+    ubo.objectPos = glm::vec3(0.0f, 0.0f, 0.0f); ubo.objectRadius = 0.2f;
+
+    // 顶点齐次坐标 (glm::vec4 对应 GLSL vec4)，按 16 字节对齐
+    ubo.positions[0] = glm::vec4(0.0f, -0.5f, 0.0f, 1.0f);
+    ubo.positions[1] = glm::vec4(0.5f,  0.5f, 0.0f, 1.0f);
+    ubo.positions[2] = glm::vec4(-0.5f, 0.5f, 0.0f, 1.0f);
+
+    // 将数据复制到已映射的 UBO 内存
+    if (currentImage < uniformBuffersMapped.size() && uniformBuffersMapped[currentImage] != nullptr) {
+        std::memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
+    }
+}
+
 void vk::draw() {
     // 1. 等待上一帧完成
     vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
@@ -1119,6 +1203,9 @@ void vk::draw() {
     // 2. 从交换链获取一张图像
     uint32_t imageIndex;
     vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+
+    // 更新当前帧的 UBO（包含顶点齐次坐标）
+    updateUniformBuffer(currentFrame);
 
     // 3. 重置 Fence 并提交命令缓冲
     vkResetFences(device, 1, &inFlightFences[currentFrame]);
@@ -1132,6 +1219,8 @@ void vk::draw() {
     submitInfo.pWaitSemaphores = waitSemaphores;
     submitInfo.pWaitDstStageMask = waitStages;
     submitInfo.commandBufferCount = 1;
+    // 注意：使用 commandBuffers[imageIndex] 要求 commandBuffers 的分配大小至少要 >= swapChainImages.size()。
+    // 请参阅 createCommandBuffers() 中的警告。如果你更倾向于每帧一个命令缓冲的策略，请提交 commandBuffers[currentFrame]。
     submitInfo.pCommandBuffers = &commandBuffers[imageIndex];
 
     VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[currentFrame]};
@@ -1229,9 +1318,13 @@ std::vector<char> vk::readFile(const std::string &filename) {
     // 从文件末尾开始读取的优点是，可以使用读取位置来确定文件的大小并分配缓冲区
 
     if (!file.is_open()) {
+        // 常见原因：相对路径相对于进程的当前工作目录 (CWD) 解析。当从构建输出目录运行（例如双击可执行文件
+        // 或某些 IDE 的默认运行配置）时，像 "src\\shader\\..." 这样的相对路径可能找不到文件，除非这些文件
+        // 已被复制到可执行目录。我们通过在 CMake 中添加 POST_BUILD 拷贝步骤来缓解此问题。可替代的修复方法：
+        //  (1) 在运行时根据可执行文件位置解析绝对路径；或 (2) 在 IDE 的运行配置中将 CWD 设置为项目根目录。
         auto c_dir = std::filesystem::current_path();
         std::cout << "Current Path: " << c_dir << std::endl;
-        std::cerr << "DEBUG: [" << filename << "]" << std::endl; // 看看括号里有没有多余空格
+        std::cerr << "DEBUG: [" << filename << "]" << std::endl; // 输出调试信息以便定位路径问题
         throw std::runtime_error("failed to open the file!");
     }
 

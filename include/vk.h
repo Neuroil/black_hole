@@ -62,6 +62,9 @@ struct UniformBufferObject {
     glm::vec3 blackholePos_1; float blackholeRadius_1;
     glm::vec3 blackholePos_2; float blackholeRadius_2;
     glm::vec3 objectPos; float objectRadius;
+    // 顶点齐次坐标数组（与顶点着色器中的 UBO 对应）
+    // 使用 vec4 保证 std140 中每个元素占 16 字节（符合 glm::vec4 的对齐）
+    alignas(16) glm::vec4 positions[3];
 };
 
 // ubo
@@ -251,6 +254,8 @@ private:
     void createDescriptorSets(); // 同时绑定 UBO 和 SSBO
     void createCommandBuffers(); // 核心修改：Compute + Barrier + Graphics
     void createSyncObjects();
+    // 更新 UBO 数据（每帧调用）
+    void updateUniformBuffer(uint32_t currentImage);
 
     void draw();
 

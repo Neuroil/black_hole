@@ -85,17 +85,20 @@
 //    // 理想情况下，Compute Shader 应该输出一个 [0, 1] 范围的深度值。
 //}
 #version 450
-vec2 positions[3] = vec2[](
-vec2(0.0, -0.5),
-vec2(0.5, 0.5),
-vec2(-0.5, 0.5)
-);
-vec3 colors[3] = vec3[](
-vec3(1.0, 0.0, 0.0),
-vec3(0.0, 1.0, 0.0),
-vec3(0.0, 0.0, 1.0)
-);
+
+// 从 UBO 中读取顶点的齐次化坐标 (vec4)，注意使用 std140 布局以保证与 C++ 端的 std140/GLM 对齐
+layout(std140, set = 0, binding = 0) uniform ObjectPositions {
+    vec4 positions[3];
+} ubo;
+
+layout(location = 0) out vec3 fragColor;
+
 void main() {
-    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
-    // 传给 Fragment Shader 的颜色
+    // 直接使用 UBO 中的齐次坐标（glm::vec4 对应 GLSL 的 vec4）
+    gl_Position = ubo.positions[gl_VertexIndex];
+
+    // 简单根据顶点索引输出颜色以便观测
+    if (gl_VertexIndex == 0) fragColor = vec3(1.0, 0.0, 0.0);
+    else if (gl_VertexIndex == 1) fragColor = vec3(0.0, 1.0, 0.0);
+    else fragColor = vec3(0.0, 0.0, 1.0);
 }
