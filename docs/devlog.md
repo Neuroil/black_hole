@@ -460,3 +460,47 @@ blackhole_prac/
     ├── texture.frag          # Stage 3
     └── geodesic.comp         # Stage 7
 ```
+
+---
+
+## 2026-06-01 — 架构重设计：采用 RAII 分层架构
+
+### 背景
+
+项目处于 Stage 0（所有阶段待实现），原有架构描述本质上是数据流图而非类设计——列出了组件和依赖关系，但没有明确 RAII 所有权、初始化/析构顺序、类边界。
+
+### 决策
+
+参考 `~/learn/sph_vulkan/plan.md` 的抽象设计，将架构替换为三层 RAII 分层模型：
+
+1. **工具层**（vulkan 工具命名空间）：纯函数，无状态，显式传 `VkDevice`
+2. **资源层**（VulkanContext / GPUBuffer / ComputePipeline / GraphicsPipeline / CommandRecord）：每个类封装一组 VkHandle，构造创建、析构销毁、只允许 move
+3. **编排层**（VulkanApp）：持有所有组件，编排初始化顺序和每帧流程
+
+### 与旧架构的关键差异
+
+| 旧架构 | 新架构 |
+|--------|--------|
+| 数据流图（组件列表 + 依赖箭头） | 分层类设计（RAII 所有权 + 接口 + 初始化顺序） |
+| 每个 Vulkan 子系统独立文件（context/debug/swapchain/pipeline/buffer/texture/commands） | 6 个内聚类 + 1 个工具命名空间 |
+| 无明确的析构顺序保证 | 成员声明逆序自动保证 |
+| RenderPass/Framebuffer 位置模糊 | 放入 VulkanContext（与 swapchain 同逻辑组） |
+| DescriptorPool 归属不明 | 放入 VulkanContext（共享分配器） |
+| ShaderModule 生命周期模糊 | pipeline 创建后立即销毁（transient） |
+
+### 不做过度设计
+
+- VulkanContext 不拆出 SwapchainManager / RenderPassFactory（当前只有一个 render pass）
+- 不预建 GPUImage RAII 类（storage image 以 raw handle 起步）
+- 不为未来多 pass 渲染预留抽象
+
+### 文件布局变化
+
+旧的 `include/vulkan/{context,debug,swapchain,pipeline,buffer,texture,commands}.h` → 新的 `include/vulkan/{vulkan_util,vulkan_context,gpu_buffer,compute_pipeline,graphics_pipeline,command_record,vulkan_app}.h`
+
+物理层（`include/physics/`、`include/scene/`）不变。
+
+### 参考
+
+- `~/learn/sph_vulkan/plan.md` — 原始架构设计文档
+- `CLAUDE.md` — 更新后的完整架构描述
