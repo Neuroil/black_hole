@@ -558,3 +558,21 @@ sensei 审阅了第一版 RAII 分层设计后，指出三个硬伤：
 ### 参考
 
 - `CLAUDE.md` — 更新后的完整架构描述（含每帧伪代码）
+
+---
+
+## 2026-06-01（续）— 架构文档独立
+
+### 决策
+
+将架构设计从 CLAUDE.md 和 devlog.md 中分离出来，写入独立的 `docs/architecture.md` 作为**唯一架构真相源**（single source of truth）。
+
+职责分工：
+- `docs/architecture.md` — 架构真相源。完整组件接口、所有权关系、初始化/析构顺序、每帧伪代码、文件布局、开发阶段、设计演进记录。开发时以此为准。
+- `CLAUDE.md` — 开发指引。引用 architecture.md，保留摘要 + 关键规范 + 当前状态 + 规划流程。给 Claude Code 提供上下文。
+- `docs/devlog.md` — 开发流程记录。只记录"做了什么、为什么"，不决定架构方向。
+
+### 文件变更
+
+- 新建 `docs/architecture.md`（完整架构文档）
+- 更新 `CLAUDE.md`（Architecture 节精简为引用 + 摘要）
