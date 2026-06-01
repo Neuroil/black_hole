@@ -511,7 +511,7 @@ blackhole_prac/
 
 ### 触发
 
-sensei 审阅了第一版 RAII 分层设计后，指出三个硬伤：
+审阅了第一版 RAII 分层设计后，指出三个硬伤：
 
 1. **CommandRecord 伪解耦**：`record_compute_dispatches(...)` 和 `record_graphics_commands(...)` 将业务逻辑写死在封装类内部。换一个物理仿真项目必须改类源码——这违反"可复用"原则。
 2. **Vulkan 1.3 Dynamic Rendering 利用不彻底**：VulkanContext 仍持有 VkRenderPass 和 VkFramebuffer[]，GraphicsPipelineConfig 仍要求传入 VkRenderPass。既然用了 Dynamic Rendering，这两个对象应该从整个架构里消失。

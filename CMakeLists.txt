@@ -10,5 +10,6 @@ find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 
 include_directories(include)
+include_directories(src)
 
 add_subdirectory(./src)
