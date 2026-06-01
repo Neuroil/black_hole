@@ -576,3 +576,85 @@ blackhole_prac/
 
 - 新建 `docs/architecture.md`（完整架构文档）
 - 更新 `CLAUDE.md`（Architecture 节精简为引用 + 摘要）
+
+---
+
+## 2026-06-02 — Stage 1 开工前置决策
+
+### 背景
+
+开始写 Stage 1（VulkanContext + vulkan_util）时，遇到几个"这个放哪"的边界问题。需要在写代码前明确 vulkan_util 的职责边界、GLFW 窗口的所有权归属、以及 VulkanContext 的构造安全模式。
+
+### 决策
+
+#### 1. vulkan_util 边界：纯机械函数，零决策
+
+`vulkan_util` 命名空间只放**输入完全决定输出、内部零判断、零偏好、零状态**的原子级 Vk* 创建函数：
+
+- **放 vulkan_util 的**：`find_memory_type`、`create_raw_buffer`、`create_shader_module`、`create_semaphore`、`create_fence`、`create_command_pool`、`allocate_command_buffer`
+- **不放 vulkan_util 的**（留在 VulkanContext 构造函数或 private helper）：
+  - `vkCreateInstance` / `vkCreateDevice` —— 有业务判断（validation layer 开关、device 打分）
+  - `glfwCreateWindowSurface` —— 依赖 GLFW，不是纯 Vulkan
+  - `choose_physical_device` / `is_physical_device_ok` —— "OK"的标准是项目偏好
+  - swapchain 创建 —— 依赖 surface + physical device 多轮查询，业务逻辑多
+
+**判断标准**：函数签名里有没有业务判断？有 → VulkanContext；没有 → vulkan_util。
+
+#### 2. GLFW 窗口：VulkanApp 负责，不是 VulkanContext
+
+窗口属于应用层编排，不是 Vulkan 硬件抽象：
+
+- `VulkanApp` 构造函数负责 `glfwInit()` + `glfwCreateWindow()`
+- `VulkanContext` 构造函数接收创建好的 `GLFWwindow*`，用它创建 `VkSurfaceKHR`
+- `VulkanApp` 析构函数在 `context_.reset()` 之后调用 `glfwDestroyWindow()` + `glfwTerminate()`
+
+不单独拆 `Window` RAII 类——当前阶段用不到。
+
+#### 3. VulkanContext 构造安全：try/catch + cleanup() + rethrow
+
+VulkanContext 构造函数中途抛异常时，析构函数不会跑，已创建的 handle 会泄漏。标准 RAII 处理：
+
+```cpp
+VulkanContext::VulkanContext(GLFWwindow* window) {
+    try {
+        // 按序创建 instance → surface → device → swapchain → ...
+    } catch (...) {
+        cleanup();  // 安全销毁已创建的所有 handle
+        throw;
+    }
+}
+
+VulkanContext::~VulkanContext() { cleanup(); }
+
+void VulkanContext::cleanup() {
+    // 每个 handle 做 if (handle != VK_NULL_HANDLE) 检查
+    // 逆序销毁：device 相关的先关 → device → instance
+}
+```
+
+核心原则：
+1. 构造函数 try/catch → cleanup() → rethrow
+2. 析构函数调用同一 cleanup()
+3. cleanup() 内每个 handle 判空，安全处理零个或多个已创建资源
+
+#### 4. vulkan.hpp vs vulkan.h
+
+选择 `vulkan.h`。项目架构已自建 RAII 分层（VulkanContext、GPUBuffer、GPUImage、*Pipeline），再用 vulkan.hpp 的 `vk::Unique*` wrapper 等于 RAII 叠 RAII——增加复杂度且 C 类型与 `vk::*` 类型不兼容。当前直接管理裸 handle 的生命周期，对理解每个对象的所有权更有帮助。
+
+#### 5. VkApplicationInfo
+
+填入项目信息，`apiVersion` 用 `VK_API_VERSION_1_3`（项目使用 Vulkan 1.3 Dynamic Rendering）：
+
+```cpp
+VkApplicationInfo app_info{};
+app_info.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+app_info.pApplicationName   = "Blackhole Simulation";
+app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
+app_info.pEngineName        = "Blackhole Simulation";
+app_info.engineVersion      = VK_MAKE_VERSION(0, 1, 0);
+app_info.apiVersion         = VK_API_VERSION_1_3;
+```
+
+### 下一步
+
+Stage 1 实现：VulkanContext 构造函数（instance → surface → physical device → logical device → command pool → descriptor pool） + vulkan_util 命名空间（find_memory_type, create_shader_module 等纯函数）。
