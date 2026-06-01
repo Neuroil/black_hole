@@ -10,7 +10,7 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_CXX_FLAGS_DEBUG": "-O0 -g",
-                "VCPKG_TARGET_TRIPLET": "arm64-linux"
+                "VCPKG_TARGET_TRIPLET": "x64-linux"
             }
         },
         {
