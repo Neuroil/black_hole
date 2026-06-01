@@ -504,3 +504,57 @@ blackhole_prac/
 
 - `~/learn/sph_vulkan/plan.md` — 原始架构设计文档
 - `CLAUDE.md` — 更新后的完整架构描述
+
+---
+
+## 2026-06-01（续）— 第二轮架构演进：名词/动词分离 + Dynamic Rendering + GPUImage
+
+### 触发
+
+sensei 审阅了第一版 RAII 分层设计后，指出三个硬伤：
+
+1. **CommandRecord 伪解耦**：`record_compute_dispatches(...)` 和 `record_graphics_commands(...)` 将业务逻辑写死在封装类内部。换一个物理仿真项目必须改类源码——这违反"可复用"原则。
+2. **Vulkan 1.3 Dynamic Rendering 利用不彻底**：VulkanContext 仍持有 VkRenderPass 和 VkFramebuffer[]，GraphicsPipelineConfig 仍要求传入 VkRenderPass。既然用了 Dynamic Rendering，这两个对象应该从整个架构里消失。
+3. **Storage Image 裸奔**：黑洞画布（Compute Write → Graphics Read）是核心数据通道，却以 raw handle 形式存在。每帧手动写 VkImageMemoryBarrier 不仅打破封装一致性，还极其容易出错。
+
+### 决策
+
+三个痛点指向同一个根因：**"业务"被写进了"封装类"**。需要将参数化架构升级为完全的名词/动词分离：
+
+| 改动 | 旧设计 | 新设计 |
+|------|--------|--------|
+| 命令封装 | CommandRecord（持有 command pool + buffer，内部写死业务录制逻辑） | CommandBuffer（纯 VkCommandBuffer 薄包装，不知道顶点缓冲/descriptor set 等业务概念，不持有 pool） |
+| 图像封装 | 无（raw handle） | GPUImage（VkImage + VkImageView + VkDeviceMemory RAII，内建 layout 追踪 + barrier 辅助方法） |
+| 渲染模型 | 传统 RenderPass/Framebuffer | Vulkan 1.3 Dynamic Rendering（vkCmdBeginRendering，管线用 VkPipelineRenderingCreateInfo） |
+| Context 胖瘦 | 持有 VkRenderPass + VkFramebuffer[] | 移除这两个对象，新增 command pool 管理 + AllocateCommandBuffer |
+| 每帧同步 | vkQueueWaitIdle 串行化 | semaphore-based（image_available → render_finished） |
+
+### CommandBuffer 设计原则
+
+- 方法签名只有 Vulkan 原生类型（`VkBuffer` 而非 `GPUBuffer&`）——零业务耦合
+- `begin_rendering(VkRenderingInfo)` / `end_rendering()` 直接映射 Dynamic Rendering API
+- `pipeline_barrier()` 接收 `VkImageMemoryBarrier` 列表——不知道 barrier 的业务语义，只管执行
+- 每帧从 VulkanContext command pool 分配，pool reset 时统一回收
+
+### GPUImage 设计原则
+
+- `create_barrier()` 纯查询（不修改内部状态），`transition_barrier()` 同步更新布局追踪
+- 不直接操作命令流（barrier 的录制由 CommandBuffer 完成）——保持名词/动词分离
+- 暂不引入 VMA（先用手动 vkAllocateMemory，后续按需迁移）
+
+### 新旧架构三层对比
+
+| 层 | 旧（第一版 RAII） | 新（名词/动词分离） |
+|----|-------------------|---------------------|
+| 工具层 | vulkan 工具 namespace（不变） | 同左 |
+| 资源层（名词） | VulkanContext, GPUBuffer, ComputePipeline, GraphicsPipeline, CommandRecord | VulkanContext(瘦身), GPUBuffer, **GPUImage(新)**, ComputePipeline, GraphicsPipeline(Dynamic Rendering) |
+| 动词层 | （无——CommandRecord 混了业务和指令） | **CommandBuffer(新)** — 纯指令，不知业务 |
+| 编排层 | VulkanApp（调度 CommandRecord 的高层方法） | VulkanApp（直接指挥 CommandBuffer，每帧数据流 100% 可见） |
+
+### 复用性
+
+整个名词层 + 动词层（VulkanContext, GPUBuffer, GPUImage, ComputePipeline, GraphicsPipeline, CommandBuffer）可在任何 Vulkan 物理仿真项目中**原样复用**。唯一项目特定的代码在 VulkanApp::step_frame() 的编排逻辑中。
+
+### 参考
+
+- `CLAUDE.md` — 更新后的完整架构描述（含每帧伪代码）
