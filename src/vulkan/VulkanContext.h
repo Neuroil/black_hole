@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <vector>
 #include <vulkan/vulkan.h>
+#include "QueueFamilyIndices.h"
 
 const std::vector<const char*> validation_layers = {"VK_LAYER_KHRONOS_validation"};
 
@@ -37,12 +38,14 @@ class VulkanContext {
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT debug_messenger_;
+    QueueFamilyIndices queue_family_indices_;
 
     // ============== helper ==============
     bool check_validation_layer_support();
     void create_vulkan_instance();
     bool is_physical_device_ok(VkPhysicalDevice physical_device);
     void pickup_physical_device();
+    QueueFamilyIndices find_queue_families(VkPhysicalDevice device);
 
     // ============== debuger ==============
     std::vector<const char*> get_required_extensions();

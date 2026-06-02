@@ -116,12 +116,9 @@ void VulkanContext::setup_debug_messenger() {
 }
 
 bool VulkanContext::is_physical_device_ok(VkPhysicalDevice physical_device) {
-    VkPhysicalDeviceProperties device_properties;
-    VkPhysicalDeviceFeatures device_features;
-    vkGetPhysicalDeviceProperties(physical_device, &device_properties);
-    vkGetPhysicalDeviceFeatures(physical_device, &device_features);
+    QueueFamilyIndices indices = find_queue_families(physical_device);
 
-    return device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    return indices.is_complete();
 }
 
 void VulkanContext::pickup_physical_device() {
@@ -142,6 +139,29 @@ void VulkanContext::pickup_physical_device() {
 
     if (physical_device_ == VK_NULL_HANDLE) throw std::runtime_error("there's no suitable GPU!");
 }
+
+QueueFamilyIndices VulkanContext::find_queue_families(VkPhysicalDevice physical_device) {
+    std::cout << "Done.\nNow finding the queue families..." << std::endl;
+    QueueFamilyIndices indices;
+
+    uint32_t queue_family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count, nullptr);
+    if (queue_family_count == 0) throw std::runtime_error("there's no queue_family in need!");
+
+    std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count, queue_families.data());
+    
+    int i = 0;
+    for(const auto& queue_family : queue_families){
+        if (queue_family.queueFlags & VK_QUEUE_GRAPHICS_BIT) indices.graphic_family_ = i;
+        if (indices.is_complete()) break;
+        i++;
+    }
+    
+    return indices;
+}
+
+// ##########################################################
 
 VulkanContext::VulkanContext(GLFWwindow* window) {
     create_vulkan_instance();
