@@ -82,7 +82,7 @@ vulkan_util 工具命名空间 (纯函数)
 
 | 阶段 | 描述 | 状态 |
 |------|------|------|
-| Stage 1 | VulkanContext + vulkan_util: instance, device, validation layers, debug messenger, surface, swapchain (Dynamic Rendering), command pool, descriptor pool | **进行中** — instance ✓, validation layers ✓, debug messenger ✓, surface ✓, physical device ✓, logical device + 3 queues (graphics/compute/present) ✓; swapchain / command pool / descriptor pool 待实现 |
+| Stage 1 | VulkanContext + vulkan_util: instance, device, validation layers, debug messenger, surface, swapchain (Dynamic Rendering), command pool, descriptor pool | **进行中** — instance ✓, validation layers ✓, debug messenger ✓, surface ✓, physical device ✓, logical device + 3 queues ✓, vulkan_util (7个纯函数) ✓; swapchain / command pool / descriptor pool 待实现 |
 | Stage 2 | GPUBuffer + GPUImage: RAII buffer 和 image 包装, staging upload, layout transition + barrier | 待实现 |
 | Stage 3 | ComputePipeline + GraphicsPipeline: RAII pipeline 包装, GraphicsPipelineConfig (VkPipelineRenderingCreateInfo) | 待实现 |
 | Stage 4 | CommandBuffer: 通用命令缓冲包装 (begin/end, bind_pipeline, bind_descriptor_sets, dispatch, begin_rendering/end_rendering, draw, pipeline_barrier) | 待实现 |

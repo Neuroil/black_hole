@@ -728,3 +728,38 @@ vkDeviceWaitIdle → vkDestroyDevice → vkDestroySurfaceKHR
 编译通过，运行验证：instance → surface → physical device → logical device + 3 queue handles 全部创建成功，validation layer 无报错，clean exit。
 
 Stage 1 剩余：swapchain、command pool、descriptor pool。这些依赖 logical device 和 queue handles（已就绪），下一步可继续。
+
+---
+
+## 2026-06-02（续）— vulkan_util 工具命名空间实现
+
+### 背景
+
+后续操作（swapchain、command pool、semaphore、fence、buffer、shader module）越来越复杂，需要先把 vulkan_util 纯函数层铺好，作为后续组件的基础构建块。
+
+### 完成内容
+
+实现了 `vulkan_util` 命名空间全部 7 个函数（`src/vulkan/vulkan_util.h` + `.cpp`）：
+
+| 函数 | 职责 | 说明 |
+|------|------|------|
+| `find_memory_type` | 从 `VkPhysicalDeviceMemoryProperties` 中查找匹配 `type_bits` 且满足 `required` 属性标志的内存类型索引 | GPUBuffer / GPUImage 构造时调用 |
+| `create_raw_buffer` | 创建 VkBuffer（不分配 VkDeviceMemory） | `sharingMode = EXCLUSIVE`，GPU 独占访问 |
+| `create_shader_module` | 读取 SPIR-V 二进制文件 → `vkCreateShaderModule` | 文件不存在或创建失败抛 runtime_error |
+| `create_semaphore` | 创建无信号的 VkSemaphore | 用于 swapchain acquire / submit 同步 |
+| `create_fence` | 创建 VkFence，flags 由调用方指定 | 可 signaled/unsignaled |
+| `create_command_pool` | 创建 VkCommandPool，指定 queue family 和 flags | `VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT` 等由调用方决定 |
+| `allocate_command_buffer` | 从指定 pool 分配 1 个 PRIMARY command buffer | 每帧临时分配，pool reset 统一回收 |
+
+### 设计原则
+
+- **零状态**：所有函数显式接收 `VkDevice`（或 `VkPhysicalDeviceMemoryProperties`），不持有任何 handle
+- **零决策**：输入完全决定输出。不含"选哪个 GPU"、"用什么格式"等业务偏好
+- **零项目依赖**：不依赖 `VulkanContext`、`GPUBuffer` 或任何项目类型。任何 Vulkan 项目可直接复用
+- **错误即抛**：所有 Vulkan 创建失败统一抛 `std::runtime_error`，调用方负责 try/catch（或依赖 RAII 析构链）
+
+判断标准来自 2026-06-02 前置决策（"纯机械函数，零决策"）：函数签名里有没有业务判断？有 → VulkanContext；没有 → vulkan_util。
+
+### 状态
+
+编译通过，`VulkanContext` 运行不受影响。vulkan_util 当前未被调用（`VulkanContext` 内部尚未切换到使用这些工具函数），后续实现 swapchain / command pool / descriptor pool 时逐一切入。
