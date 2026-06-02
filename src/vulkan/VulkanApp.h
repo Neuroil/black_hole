@@ -7,13 +7,15 @@
 
 #include "VulkanContext.h"
 #include <GLFW/glfw3.h>
+#include <memory>
 
 class VulkanApp {
+    std::unique_ptr<VulkanContext> context_;
     uint32_t WIDTH, HEIGHT;
     GLFWwindow* window = nullptr;
 
     void init_window();
-    void init_vulkan();
+
     void main_loop();
     void clean_up();
 
