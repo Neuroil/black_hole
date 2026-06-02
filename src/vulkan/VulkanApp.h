@@ -11,10 +11,8 @@
 
 class VulkanApp {
     std::unique_ptr<VulkanContext> context_;
-    uint32_t WIDTH, HEIGHT;
-    GLFWwindow* window = nullptr;
-
-    void init_window();
+    // uint32_t WIDTH, HEIGHT;
+    GLFWwindow* window_ = nullptr;
 
     void main_loop();
     void clean_up();

@@ -10,15 +10,21 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <glm/ext/scalar_uint_sized.hpp>
 #include <vulkan/vulkan.h>
 #include "QueueFamilyIndices.h"
+#include "SwapChainSupportDetails.h"
 
 const std::vector<const char*> validation_layers = {"VK_LAYER_KHRONOS_validation"};
 
+const std::vector<const char*> device_extensions = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME
+};
+
 #ifdef NDEBUG
-const bool enableValidationLayers = false;
+constexpr bool enable_validation_layers = false;
 #else
-const bool enableValidationLayers = true;
+constexpr bool enable_validation_layers = true;
 #endif
 
 VkResult CreateDebugUtilsMessengerEXT(VkInstance instance_,
@@ -29,12 +35,12 @@ void DestroyDebugUtilsMessengerEXT(VkInstance instance_, VkDebugUtilsMessengerEX
                                    const VkAllocationCallbacks* p_allocator);
 
 
-
 // ###############################################################
 
 
-
 class VulkanContext {
+    uint32_t WIDTH, HEIGHT;
+    GLFWwindow* window_;
     VkInstance instance_;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
@@ -43,18 +49,32 @@ class VulkanContext {
     VkQueue graphics_queue_ = VK_NULL_HANDLE;
     VkQueue compute_queue_ = VK_NULL_HANDLE;
     VkQueue present_queue_ = VK_NULL_HANDLE;
+    VkSwapchainKHR swap_chain_;
+    std::vector<VkImage> swap_chain_images_;
+    VkFormat swap_chain_image_format_;
+    VkExtent2D swap_chain_extent_;
+    std::vector<VkImageView> swap_chain_image_views_;
 
     // ============== helper ==============
+    void init_window();
     bool check_validation_layer_support();
     void create_vulkan_instance();
     bool is_physical_device_ok(VkPhysicalDevice physical_device);
+    bool check_device_extension_support(VkPhysicalDevice physical_device);
     void pickup_physical_device();
     QueueFamilyIndices find_queue_families(VkPhysicalDevice device);
-    void create_surface(GLFWwindow* window);
+    void create_surface();
     void create_logical_device();
+    SwapChainSupportDetails query_swap_chain_support(VkPhysicalDevice device);
+    VkSurfaceFormatKHR choose_swap_surface_format(const std::vector<VkSurfaceFormatKHR>& available_formats);
+    VkPresentModeKHR choose_swap_present_mode(const std::vector<VkPresentModeKHR>& available_present_modes);
+    VkExtent2D choose_swap_extent(const VkSurfaceCapabilitiesKHR& capabilities);
+    void create_swap_chain();
+    void create_image_views();
 
     // ============== debuger ==============
     std::vector<const char*> get_required_extensions();
+
     static VKAPI_ATTR VkBool32 VKAPI_CALL
     debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
                    VkDebugUtilsMessageTypeFlagsEXT messageType,
@@ -63,10 +83,11 @@ class VulkanContext {
 
         return VK_FALSE;
     }
+
     void setup_debug_messenger();
 
-  public:
-    explicit VulkanContext(GLFWwindow* window);
+public:
+    explicit VulkanContext(uint32_t w, uint32_t h);
     ~VulkanContext();
 
     // 禁止拷贝构造
@@ -112,6 +133,9 @@ class VulkanContext {
     uint32_t acquire_next_image(VkSemaphore signal_semaphore);
     void submit(VkCommandBuffer cmd, VkSemaphore wait, VkSemaphore signal);
     void present(uint32_t image_index, VkSemaphore wait_semaphore);
+
+    // window
+    GLFWwindow* get_p_windows() const { return window_; }
 };
 
 #endif // BLACK_HOLE_PRAC_VULKANCONTEXT_H

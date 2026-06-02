@@ -763,3 +763,91 @@ Stage 1 剩余：swapchain、command pool、descriptor pool。这些依赖 logic
 ### 状态
 
 编译通过，`VulkanContext` 运行不受影响。vulkan_util 当前未被调用（`VulkanContext` 内部尚未切换到使用这些工具函数），后续实现 swapchain / command pool / descriptor pool 时逐一切入。
+
+---
+
+## 2026-06-02（续）— swapchain + image views 实现
+
+### 背景
+
+logical device 和 surface 就绪后，下一步是创建 swapchain 和 image views。同时做了两个架构调整：GLFW 窗口所有权从 VulkanApp 移入 VulkanContext，物理设备筛选加入设备扩展和 swapchain 支持检查。
+
+### 架构变更
+
+**1. GLFW 窗口归 VulkanContext 所有**
+
+之前的设计：VulkanApp 创建窗口 → 传 `GLFWwindow*` 给 VulkanContext 构造函数 → VulkanContext 用完即丢。但 swapchain extent 需要 `glfwGetFramebufferSize(window)`，swapchain 重建也需要窗口指针——存裸指针不如直接接管所有权。
+
+- `VulkanContext` 构造函数改为 `(uint32_t w, uint32_t h)`，内部 `init_window()` 调 `glfwInit` + `glfwCreateWindow`
+- 析构负责 `glfwDestroyWindow` + `glfwTerminate`
+- `get_p_windows()` getter 暴露裸指针给 VulkanApp（主循环判断 `glfwWindowShouldClose`）
+- VulkanApp 从 `window_ = context_->get_p_windows()` 获取，不再自己管理窗口生命周期
+
+**2. 物理设备筛选增强**
+
+`is_physical_device_ok` 现在检查三项：
+- 队列族完整（graphics + compute + present）
+- 设备扩展支持（`check_device_extension_support`：验证 `VK_KHR_SWAPCHAIN_EXTENSION_NAME` 存在）
+- swapchain 支持（`query_swap_chain_support`：至少有一种 surface format 和 present mode）
+
+**3. 设备扩展声明提升**
+
+`device_extensions` 常量从 `create_logical_device` 内部提升到头文件作用域，与 `validation_layers` 同级——物理设备筛选和逻辑设备创建都需要引用。
+
+### 新增文件
+
+- `src/vulkan/SwapChainSupportDetails.h` —— 查询结果结构体：`VkSurfaceCapabilitiesKHR` + `vector<VkSurfaceFormatKHR>` + `vector<VkPresentModeKHR>`
+
+### VulkanContext 新增方法
+
+| 方法 | 职责 |
+|------|------|
+| `init_window()` | glfwInit → glfwCreateWindow（无 OpenGL 上下文，不可 resize） |
+| `check_device_extension_support()` | 枚举设备扩展，验证 `VK_KHR_SWAPCHAIN_EXTENSION_NAME` 可用 |
+| `query_swap_chain_support()` | 查询 surface capabilities + formats + present modes |
+| `choose_swap_surface_format()` | 优先 `VK_FORMAT_B8G8R8A8_SRGB` + SRGB 非线性色彩空间 |
+| `choose_swap_present_mode()` | 优先 MAILBOX（低延迟），回退 FIFO（保证可用） |
+| `choose_swap_extent()` | 优先 `currentExtent`，Wayland/特殊窗口管理器下通过 `glfwGetFramebufferSize` 计算并 clamp |
+| `create_swap_chain()` | 完整流程：query → choose → VkSwapchainCreateInfoKHR → 创建 → 取回 images → 缓存 format/extent |
+| `create_image_views()` | 为每个 swapchain image 创建 `VkImageView`（2D, COLOR, 单 mip/layer） |
+
+### swapchain 关键配置
+
+- `minImageCount`：`capabilities.minImageCount + 1`（多一个缓冲，避免 driver 内部匮乏导致 acquire 阻塞）
+- `imageSharingMode`：graphics 和 present 同族 → `EXCLUSIVE`；不同族 → `CONCURRENT`（跨队列族共享）
+- `imageUsage`：`VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT`（Dynamic Rendering 直接渲染到 swapchain image）
+- `preTransform`：`currentTransform`（不旋转）
+- `compositeAlpha`：`OPAQUE`（不混合窗口透明度）
+- `presentMode`：MAILBOX 或回退 FIFO
+- `clipped`：`VK_TRUE`（被遮挡像素不渲染）
+
+### 构造函数初始化链
+
+```
+init_window()
+  → create_vulkan_instance()
+  → setup_debug_messenger()
+  → create_surface()
+  → pickup_physical_device()
+  → create_logical_device()
+  → create_swap_chain()
+  → create_image_views()
+```
+
+### 析构链
+
+```
+destroy swapchain image views
+  → destroy swapchain
+  → vkDeviceWaitIdle → vkDestroyDevice
+  → vkDestroySurfaceKHR
+  → DestroyDebugUtilsMessengerEXT
+  → vkDestroyInstance
+  → glfwDestroyWindow → glfwTerminate
+```
+
+### 验证
+
+编译零警告，程序运行时全链路输出正常，validation layer 无报错，clean exit。
+
+Stage 1 剩余：command pool、descriptor pool。

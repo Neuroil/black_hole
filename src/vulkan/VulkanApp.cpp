@@ -4,14 +4,12 @@
 
 #include "VulkanApp.h"
 
-VulkanApp::VulkanApp(uint32_t w, uint32_t h) : WIDTH(w), HEIGHT(h), context_(nullptr){
-    init_window();
-    context_ = std::make_unique<VulkanContext>(window);
+VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr){
+    context_ = std::make_unique<VulkanContext>(w,h);
+    window_ = context_->get_p_windows();
 }
 VulkanApp::~VulkanApp() {
-    glfwDestroyWindow(window);
 
-    glfwTerminate();
 }
 
 void VulkanApp::run() {
@@ -21,18 +19,8 @@ void VulkanApp::run() {
     clean_up();
 }
 
-void VulkanApp::init_window() {
-    glfwInit();
-
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-
-    window = glfwCreateWindow(WIDTH, HEIGHT, "Blackhole GRRT Simulation", nullptr, nullptr);
-}
-
-
 void VulkanApp::main_loop() {
-    while (!glfwWindowShouldClose(window)) {
+    while (!glfwWindowShouldClose(window_)) {
         glfwPollEvents();
     }
 }
