@@ -658,3 +658,73 @@ app_info.apiVersion         = VK_API_VERSION_1_3;
 ### 下一步
 
 Stage 1 实现：VulkanContext 构造函数（instance → surface → physical device → logical device → command pool → descriptor pool） + vulkan_util 命名空间（find_memory_type, create_shader_module 等纯函数）。
+
+---
+
+## 2026-06-02 — Stage 1 实现：instance → surface → physical device → logical device + 三队列
+
+### 背景
+
+从 `pickup_physical_device` 的队列族查找报错（`physical_device_` vs `physical_device` 形参用混）出发，发现 `QueueFamilyIndices` 只查了 graphics 队列——但项目需要 graphics、compute（测地线积分）、present（上屏）三个队列。需求比 Vulkan 教程的标准路径多了一个 compute 队列。
+
+### 完成内容
+
+**1. QueueFamilyIndices 扩充**（`src/vulkan/QueueFamilyIndices.h`）
+
+| 改动 | 说明 |
+|------|------|
+| 新增 `compute_family_` | 筛选策略：优先专用 compute 族（不带 GRAPHICS 位）→ 回退 graphics 族 |
+| 新增 `present_family_` | 通过 `vkGetPhysicalDeviceSurfaceSupportKHR` 逐族查询 |
+| `is_complete()` | 三个 optional 全部 has_value() 才返回 true |
+| 移除自由函数 | `find_queue_families` 改为 `VulkanContext` 的 private 成员（需要访问 `surface_`） |
+
+**2. surface 提前创建** — 因为 present 队列的查询依赖 surface，构造顺序调整为：
+
+```
+create_vulkan_instance() → setup_debug_messenger() → create_surface(window)
+→ pickup_physical_device() → create_logical_device()
+```
+
+新增 `GLFW_INCLUDE_VULKAN` 宏（`VulkanContext.h`），否则 `glfwCreateWindowSurface` 不可见。
+
+**3. `find_queue_families` 重写**（`VulkanContext.cpp:144-194`）
+
+- graphics: `VK_QUEUE_GRAPHICS_BIT`
+- compute: 先扫专用 compute 族（`COMPUTE` 有、`GRAPHICS` 无）→ 没找到则回退到任意含 `COMPUTE` 的族
+- present: 逐个 queue family 调 `vkGetPhysicalDeviceSurfaceSupportKHR`
+
+**4. `create_logical_device` 实现**（`VulkanContext.cpp:203-253`）
+
+关键步骤：
+
+1. 调用 `find_queue_families(physical_device_)` 获取当前物理设备的队列族（局部变量，不存成员）
+2. **去重**：将三个 family index 放入 `std::set<uint32_t>`——同一个 family 在 `VkDeviceQueueCreateInfo` 数组里只能出现一次
+3. 每个 unique family 一条 `VkDeviceQueueCreateInfo`，`queueCount=1`，优先级 `1.0f`
+4. 设备扩展：`VK_KHR_SWAPCHAIN_EXTENSION_NAME`
+5. Vulkan 1.3 features：启用 `dynamicRendering`（`VkPhysicalDeviceVulkan13Features` 挂 pNext 链）
+6. `vkCreateDevice` → `vkGetDeviceQueue` × 3（graphics / compute / present）
+
+**5. 析构补全**（`VulkanContext.cpp:266-274`）
+
+```
+vkDeviceWaitIdle → vkDestroyDevice → vkDestroySurfaceKHR
+→ DestroyDebugUtilsMessengerEXT → vkDestroyInstance
+```
+
+`surface_` 和 `device_` 判空后销毁，构造中途异常退出时安全（成员 initialize 为 `VK_NULL_HANDLE`）。
+
+**6. 移除 `queue_family_indices_` 成员变量**
+
+`QueueFamilyIndices` 是初始化脚手架——只在 `pickup_physical_device`（`is_physical_device_ok` 判定用）和 `create_logical_device`（建 device 和取 queue handle 用）两个时刻需要。建完逻辑设备后不再使用，不应占成员变量。改为在 `create_logical_device` 内部以局部变量存在。
+
+### 设计决策
+
+- **compute 队列优先专用族**：离散 GPU 通常有独立的 compute-only 队列族，可与 graphics 管线异步并行。测地线积分跑在上面不阻塞渲染。无专用族时回退 graphics 族。
+- **`VkDeviceCreateInfo::pNext` 挂 `VkPhysicalDeviceVulkan13Features`**：显式启用 `dynamicRendering`，后续所有管线创建和绘制均走 Dynamic Rendering 路径。
+- **`QueueFamilyIndices` 是临时变量**：不是 Vulkan 资源（无 VkHandle），不需要 RAII 管理，初始化后即丢弃。进成员变量违反最小生命周期原则。
+
+### 状态
+
+编译通过，运行验证：instance → surface → physical device → logical device + 3 queue handles 全部创建成功，validation layer 无报错，clean exit。
+
+Stage 1 剩余：swapchain、command pool、descriptor pool。这些依赖 logical device 和 queue handles（已就绪），下一步可继续。

@@ -5,6 +5,7 @@
 #ifndef BLACK_HOLE_PRAC_VULKANCONTEXT_H
 #define BLACK_HOLE_PRAC_VULKANCONTEXT_H
 
+#define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <stdexcept>
@@ -35,10 +36,13 @@ void DestroyDebugUtilsMessengerEXT(VkInstance instance_, VkDebugUtilsMessengerEX
 
 class VulkanContext {
     VkInstance instance_;
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT debug_messenger_;
-    QueueFamilyIndices queue_family_indices_;
+    VkQueue graphics_queue_ = VK_NULL_HANDLE;
+    VkQueue compute_queue_ = VK_NULL_HANDLE;
+    VkQueue present_queue_ = VK_NULL_HANDLE;
 
     // ============== helper ==============
     bool check_validation_layer_support();
@@ -46,6 +50,8 @@ class VulkanContext {
     bool is_physical_device_ok(VkPhysicalDevice physical_device);
     void pickup_physical_device();
     QueueFamilyIndices find_queue_families(VkPhysicalDevice device);
+    void create_surface(GLFWwindow* window);
+    void create_logical_device();
 
     // ============== debuger ==============
     std::vector<const char*> get_required_extensions();

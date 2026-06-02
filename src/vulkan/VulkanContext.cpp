@@ -5,6 +5,7 @@
 #include "VulkanContext.h"
 #include "vulkan_util.h"
 #include <cstring>
+#include <set>
 
 VkResult CreateDebugUtilsMessengerEXT(VkInstance instance_,
                                       const VkDebugUtilsMessengerCreateInfoEXT* p_create_info,
@@ -125,7 +126,7 @@ void VulkanContext::pickup_physical_device() {
     std::cout << "Done.\nNow picking up the physical device..." << std::endl;
     uint32_t physical_device_count = 0;
     vkEnumeratePhysicalDevices(instance_, &physical_device_count, nullptr);
-    if (physical_device_count == 0) throw std::runtime_error("failed to enumerate physical deivces!");
+    if (physical_device_count == 0) throw std::runtime_error("failed to find GPUs with Vulkan support!");
 
     std::vector<VkPhysicalDevice> physical_devices(physical_device_count);
     vkEnumeratePhysicalDevices(instance_, &physical_device_count, physical_devices.data());
@@ -141,24 +142,115 @@ void VulkanContext::pickup_physical_device() {
 }
 
 QueueFamilyIndices VulkanContext::find_queue_families(VkPhysicalDevice physical_device) {
-    std::cout << "Done.\nNow finding the queue families..." << std::endl;
+    std::cout << "...finding the queue families..." << std::endl;
     QueueFamilyIndices indices;
 
     uint32_t queue_family_count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count, nullptr);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nullptr);
     if (queue_family_count == 0) throw std::runtime_error("there's no queue_family in need!");
 
     std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
-    vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count, queue_families.data());
-    
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, queue_families.data());
+
     int i = 0;
-    for(const auto& queue_family : queue_families){
-        if (queue_family.queueFlags & VK_QUEUE_GRAPHICS_BIT) indices.graphic_family_ = i;
-        if (indices.is_complete()) break;
+    for (const auto& qf : queue_families) {
+        // graphics
+        if (qf.queueFlags & VK_QUEUE_GRAPHICS_BIT)
+            indices.graphic_family_ = i;
+
+        // compute: 优先专用 compute 族（无 GRAPHICS 位），可异步并行
+        if ((qf.queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            !(qf.queueFlags & VK_QUEUE_GRAPHICS_BIT))
+            indices.compute_family_ = i;
+
         i++;
     }
-    
+
+    // compute 回退：无专用 compute 族时，用 graphics 族
+    if (!indices.compute_family_.has_value()) {
+        i = 0;
+        for (const auto& qf : queue_families) {
+            if (qf.queueFlags & VK_QUEUE_COMPUTE_BIT) {
+                indices.compute_family_ = i;
+                break;
+            }
+            i++;
+        }
+    }
+
+    // present: 需要 surface，逐族查询
+    i = 0;
+    for (const auto& qf : queue_families) {
+        VkBool32 present_support = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, i, surface_, &present_support);
+        if (present_support) {
+            indices.present_family_ = i;
+            break;
+        }
+        i++;
+    }
+
     return indices;
+}
+
+void VulkanContext::create_surface(GLFWwindow* window) {
+    std::cout << "Done.\nNow creating the window surface..." << std::endl;
+    if (glfwCreateWindowSurface(instance_, window, nullptr, &surface_) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create window surface!");
+    }
+}
+
+void VulkanContext::create_logical_device() {
+    std::cout << "Done.\nNow creating the logical device..." << std::endl;
+
+    QueueFamilyIndices indices = find_queue_families(physical_device_);
+
+    // 去重
+    std::set<uint32_t> unique_families = {
+        indices.graphic_family_.value(),
+        indices.compute_family_.value(),
+        indices.present_family_.value(),
+    };
+
+    float queue_priority = 1.0f;
+    std::vector<VkDeviceQueueCreateInfo> queue_infos;
+    for (uint32_t family : unique_families) {
+        queue_infos.push_back({
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex = family,
+            .queueCount = 1,
+            .pQueuePriorities = &queue_priority,
+        });
+    }
+
+    // 设备扩展
+    std::vector<const char*> device_extensions = {
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    };
+
+    // Dynamic Rendering
+    VkPhysicalDeviceVulkan13Features features_13{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .dynamicRendering = VK_TRUE,
+    };
+
+    VkDeviceCreateInfo device_info{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &features_13,
+        .queueCreateInfoCount = static_cast<uint32_t>(queue_infos.size()),
+        .pQueueCreateInfos = queue_infos.data(),
+        .enabledExtensionCount = static_cast<uint32_t>(device_extensions.size()),
+        .ppEnabledExtensionNames = device_extensions.data(),
+    };
+
+    if (vkCreateDevice(physical_device_, &device_info, nullptr, &device_) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create logical device!");
+    }
+
+    // 取回队列句柄
+    vkGetDeviceQueue(device_, indices.graphic_family_.value(), 0, &graphics_queue_);
+    vkGetDeviceQueue(device_, indices.compute_family_.value(), 0, &compute_queue_);
+    vkGetDeviceQueue(device_, indices.present_family_.value(), 0, &present_queue_);
 }
 
 // ##########################################################
@@ -166,13 +258,19 @@ QueueFamilyIndices VulkanContext::find_queue_families(VkPhysicalDevice physical_
 VulkanContext::VulkanContext(GLFWwindow* window) {
     create_vulkan_instance();
     setup_debug_messenger();
+    create_surface(window);
     pickup_physical_device();
+    create_logical_device();
 }
 
 VulkanContext::~VulkanContext() {
+    if (device_ != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(device_);
+        vkDestroyDevice(device_, nullptr);
+    }
+    if (surface_ != VK_NULL_HANDLE) vkDestroySurfaceKHR(instance_, surface_, nullptr);
     if (enableValidationLayers) {
         DestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
     }
     vkDestroyInstance(instance_, nullptr);
-    //
 }
