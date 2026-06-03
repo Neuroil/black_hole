@@ -87,7 +87,7 @@ VkCommandBuffer allocate_command_buffer(VkDevice device, VkCommandPool pool);
 ```cpp
 class VulkanContext {
 public:
-    explicit VulkanContext(GLFWwindow* window);
+    explicit VulkanContext(uint32_t w, uint32_t h);
     ~VulkanContext();
     VulkanContext(const VulkanContext&) = delete;
 
@@ -159,20 +159,15 @@ public:
     // host-visible 内存映射
     void* map(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
     void  unmap();
-
-    // 通过 staging buffer 上传数据（初始化期专用，内部同步等待）
-    void upload_from_host(const void* data,
-                          VkDeviceSize offset,
-                          VkDeviceSize size);
 };
 ```
 
 **设计决策**：
-- 构造时持有 `const VulkanContext*` ——析构时通过 `context_->device()` 获取 device、`upload_from_host` 通过 `context_` 拿 command pool 和 queue，不再重复持有裸 `VkDevice`
+- 构造时持有 `const VulkanContext*` ——析构时通过 `context_->device()` 获取 device，不再重复持有裸 `VkDevice`
 - 构造时通过 `VulkanContext::memory_properties()` 查询合适的内存类型，一步完成 buffer 创建 + 内存分配 + 绑定
-- `upload_from_host` 封装 staging buffer → vkCmdCopyBuffer → vkQueueWaitIdle 完整流程，command pool / queue 从 `context_` 内部获取
 - 被 move 后的对象处于安全空状态（指针置 `nullptr`，handle 置 `VK_NULL_HANDLE`）
-- 本项目中的用途：vertex buffer（全屏四边形 6 顶点）、uniform buffer（相机/场景参数）、storage buffer（光线初始状态）
+- 本项目中的用途：vertex buffer（待渲染对象）、uniform buffer（相机/场景参数）、storage buffer（储存 `compute_pipeline` 所需数据）
+> 不提供 `upload_from_host` —— staging upload 是上层编排职责，不属于 buffer RAII 容器。GPUBuffer 只提供 `map()` / `unmap()`（host-visible buffer），数据上传由 VulkanApp 或独立动词类编排
 
 ---
 
@@ -217,11 +212,12 @@ private:
     VkFormat       format_;
     VkExtent2D     extent_;
     VkImageLayout  current_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkDevice       device_;  // 析构时需要
+    const VulkanContext* context_ = nullptr;
 };
 ```
 
 **设计决策**：
+- 构造时持有 `const VulkanContext*` ——析构时通过 `context_->device()` 获取 device，与 GPUBuffer 保持一致
 - 不内置 VMA（Vulkan Memory Allocator）——先用手动 `vkAllocateMemory`，后续按需引入
 - `create_barrier()` 不修改内部状态（纯查询），`transition_barrier()` 同步更新布局追踪
 - barrier 的执行由 CommandBuffer::pipeline_barrier 负责——GPUImage 不直接操作命令流（名词/动词分离）
@@ -660,5 +656,6 @@ blackhole_prac/
 | 2026-05-29 | 初始架构 | 数据流图式架构（VulkanContext → Surface → Pipeline → Buffer） |
 | 2026-06-01 v1 | RAII 分层 | 参考 sph_vulkan/plan.md，引入三层 RAII 模型，但 CommandRecord 含业务逻辑、VulkanContext 含 RenderPass |
 | 2026-06-01 v2 | 名词/动词分离 + Dynamic Rendering | CommandRecord → CommandBuffer（纯动词），新增 GPUImage，砍掉 RenderPass/Framebuffer，Vulkan 1.3 Dynamic Rendering 全覆盖 |
+| 2026-06-03 v3 | 名词类 context 指针统一 + 职责边界修正 | GPUBuffer/GPUImage 统一持有 `const VulkanContext*` 替代裸 `VkDevice`，砍掉 GPUBuffer 的 `upload_from_host`（越界），VulkanContext 构造函数内置窗口创建 |
 
-当前版本：**v2**（2026-06-01）
+当前版本：**v3**（2026-06-03）

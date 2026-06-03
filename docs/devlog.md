@@ -874,3 +874,20 @@ GPUBuffer 不再单独持有裸 `VkDevice`，改为构造时存储 `const Vulkan
 - move 后指针置 `nullptr`，与 handle 的 `VK_NULL_HANDLE` 保持一致
 
 理由：消除多级组件各持一份 `VkDevice` 副本的问题，单一真相源通过 `VulkanContext` 统一访问。
+
+---
+
+### GPUBuffer 职责边界修正
+
+砍掉 `upload_from_host`——原因：该方法需要分配 command buffer、提交队列操作，越过了 GPUBuffer 作为名词（RAII 容器）的职责边界。staging upload 是上层编排（VulkanApp）的动词职责，不应下沉到 buffer 类中。GPUBuffer 现在只提供 `map()` / `unmap()`（host-visible buffer），数据上传由上层负责。
+
+---
+
+### GPUImage 实现
+
+完成 GPUImage 类（头文件 + 源文件），接口对齐 GPUBuffer 设计模式：
+- 构造：`const VulkanContext*` → vkCreateImage → vkAllocateMemory → vkBindImageMemory → vkCreateImageView
+- 析构：ImageView → Memory → Image（context + handle 双检）
+- move 构造/赋值：逐成员转移 + 源置空，禁止拷贝
+- barrier：`create_barrier()` 纯查询 / `transition_barrier()` 同步更新布局追踪
+- 异常安全：构造每步失败自清理已创建资源

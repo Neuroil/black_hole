@@ -71,7 +71,7 @@ vulkan_util 工具命名空间 (纯函数)
 
 ## Tool usage
 
-- **文件修改**：使用 `Read` / `Edit` / `Write` 工具。不得通过 Bash 调用 `sed` / `awk` / `perl` 等文本处理命令修改仓库文件。
+- **文件修改**：所有源代码改动必须派 sub-agent（遵循 work skill 五段流水线：recall → scout → research → delegate → summarize），主对话只编排不亲自改代码。唯一例外：sensei 明确说"你自己改"时可直接操作。文档（`docs/*.md`、`CLAUDE.md`）的更新同样适用此规则。使用 `Read` / `Edit` / `Write` 工具，不得通过 Bash 调用 `sed` / `awk` / `perl` 等文本处理命令修改仓库文件。
 - **文件搜索**：使用 `Glob` 或 Bash `find` 查找文件，使用 LSP（`findReferences` / `goToDefinition` / `hover`）查找符号引用和定义。Bash `grep` 仅用于快速定位行号，不用于批量替换。
 - **Bash**：专用于构建（cmake / ninja）、运行、git 操作、文件列表（`find` / `ls`）、项目状态查询。
 - **并发**：相互独立的工具调用应在单次响应中并行发出，减少往返延迟。
@@ -84,7 +84,7 @@ vulkan_util 工具命名空间 (纯函数)
 | 阶段 | 描述 | 状态 |
 |------|------|------|
 | Stage 1 | VulkanContext + vulkan_util: instance, device, validation layers, debug messenger, surface, swapchain (Dynamic Rendering), command pool, descriptor pool | **完成** — instance ✓, validation layers ✓, debug messenger ✓, surface ✓, physical device ✓, logical device + 3 queues ✓, vulkan_util (8个纯函数) ✓, swapchain ✓, image views ✓, memory properties ✓, command pool ✓, descriptor pool ✓, pipeline cache ✓, queue_family_index ✓, swapchain frame loop stubs (acquire/submit/present) ✓, 所有 getter 实现 ✓ |
-| Stage 2 | GPUBuffer + GPUImage: RAII buffer 和 image 包装, staging upload, layout transition + barrier | 待实现 |
+| Stage 2 | GPUBuffer + GPUImage: RAII buffer 和 image 包装, staging upload, layout transition + barrier | **完成** — GPUBuffer ✓, GPUImage ✓ |
 | Stage 3 | ComputePipeline + GraphicsPipeline: RAII pipeline 包装, GraphicsPipelineConfig (VkPipelineRenderingCreateInfo) | 待实现 |
 | Stage 4 | CommandBuffer: 通用命令缓冲包装 (begin/end, bind_pipeline, bind_descriptor_sets, dispatch, begin_rendering/end_rendering, draw, pipeline_barrier) | 待实现 |
 | Stage 5 | VulkanApp: 顶层编排, 组件持有与初始化, 每帧 Dynamic Rendering 流程 | 待实现 |
