@@ -13,9 +13,7 @@ VulkanApp::~VulkanApp() {
 }
 
 void VulkanApp::run() {
-    // main_loop
     main_loop();
-    // release
     clean_up();
 }
 

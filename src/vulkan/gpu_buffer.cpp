@@ -7,7 +7,8 @@
 #include <cstring>
 #include <stdexcept>
 
-GPUBuffer::GPUBuffer(const VulkanContext* p_context, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags memory_properties) {
+GPUBuffer::GPUBuffer(const VulkanContext* p_context, VkDeviceSize size, VkBufferUsageFlags usage,
+                     VkMemoryPropertyFlags memory_properties) {
     if (size == 0) {
         throw std::invalid_argument("buffer size must be > 0");
     }
@@ -56,10 +57,9 @@ GPUBuffer::~GPUBuffer() {
 
 GPUBuffer::GPUBuffer(GPUBuffer&& other) noexcept
     : context_(other.context_)
-    , size_(other.size_)
-    , buffer_(other.buffer_)
-    , memory_(other.memory_)
-{
+      , size_(other.size_)
+      , buffer_(other.buffer_)
+      , memory_(other.memory_) {
     other.context_ = nullptr;
     other.size_ = 0;
     other.buffer_ = VK_NULL_HANDLE;
@@ -91,13 +91,9 @@ GPUBuffer& GPUBuffer::operator=(GPUBuffer&& other) noexcept {
     return *this;
 }
 
-VkBuffer GPUBuffer::buffer() const {
-    return buffer_;
-}
+VkBuffer GPUBuffer::buffer() const { return buffer_; }
 
-VkDeviceSize GPUBuffer::size() const {
-    return size_;
-}
+VkDeviceSize GPUBuffer::size() const { return size_; }
 
 void* GPUBuffer::map(VkDeviceSize offset, VkDeviceSize size) {
     void* data;
@@ -110,4 +106,3 @@ void* GPUBuffer::map(VkDeviceSize offset, VkDeviceSize size) {
 void GPUBuffer::unmap() {
     vkUnmapMemory(context_->device(), memory_);
 }
-

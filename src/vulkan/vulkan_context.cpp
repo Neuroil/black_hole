@@ -40,7 +40,7 @@ void VulkanContext::init_window() {
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
-    window_ = glfwCreateWindow(static_cast<int>(WIDTH), static_cast<int>(HEIGHT), "Blackhole GRRT Simulation", nullptr,
+    window_ = glfwCreateWindow(static_cast<int>(WIDTH), static_cast<int>(HEIGHT), "GRRT Simulator", nullptr,
                                nullptr);
 }
 
@@ -503,6 +503,7 @@ uint32_t VulkanContext::queue_family_index() const { return graphics_queue_famil
 // ── Swapchain 查询 ──
 
 VkSwapchainKHR VulkanContext::swapchain() const { return swap_chain_; }
+VkImage VulkanContext::swapchain_image(uint32_t i) const { return swap_chain_images_[i]; }
 VkImageView VulkanContext::swapchain_view(uint32_t i) const { return swap_chain_image_views_[i]; }
 uint32_t VulkanContext::swapchain_view_count() const { return static_cast<uint32_t>(swap_chain_image_views_.size()); }
 VkFormat VulkanContext::swapchain_format() const { return swap_chain_image_format_; }

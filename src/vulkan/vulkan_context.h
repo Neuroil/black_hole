@@ -122,6 +122,7 @@ public:
 
     // Swapchain
     VkSwapchainKHR swapchain() const;
+    VkImage swapchain_image(uint32_t i) const;
     VkImageView swapchain_view(uint32_t i) const;
     uint32_t swapchain_view_count() const;
     VkFormat swapchain_format() const;

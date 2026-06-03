@@ -6,12 +6,12 @@
 #define BLACK_HOLE_PRAC_VULKANAPP_H
 
 #include "vulkan_context.h"
+#include <vulkan/vulkan_core.h>
 #include <GLFW/glfw3.h>
 #include <memory>
 
 class VulkanApp {
     std::unique_ptr<VulkanContext> context_;
-    // uint32_t WIDTH, HEIGHT;
     GLFWwindow* window_ = nullptr;
 
     void main_loop();
