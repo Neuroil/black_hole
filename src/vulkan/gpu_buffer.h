@@ -9,8 +9,13 @@
 #include <vulkan/vulkan_core.h>
 
 class GPUBuffer {
+    const VulkanContext* context_ = nullptr;
+    VkDeviceSize size_ = 0;
+    VkBuffer buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory memory_ = VK_NULL_HANDLE;
+
 public:
-    GPUBuffer(const VulkanContext& context,
+    GPUBuffer(const VulkanContext* p_context,
               VkDeviceSize size,
               VkBufferUsageFlags usage,
               VkMemoryPropertyFlags memory_properties);
@@ -19,22 +24,15 @@ public:
     GPUBuffer(GPUBuffer&& other) noexcept;
     GPUBuffer& operator=(GPUBuffer&& other) noexcept;
 
+    GPUBuffer(const GPUBuffer&) = delete;
+    GPUBuffer& operator=(const GPUBuffer&) = delete;
+
     VkBuffer     buffer() const;
     VkDeviceSize size()   const;
 
     // host-visible 内存映射
     void* map(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
     void  unmap();
-
-    // 通过 staging buffer 上传数据（初始化期专用，内部同步等待）
-    void upload_from_host(const VulkanContext& context,
-                          const void* data,
-                          VkDeviceSize offset,
-                          VkDeviceSize size,
-                          VkCommandPool command_pool,
-                          VkQueue queue);
 };
-
-
 
 #endif //BLACK_HOLE_PRAC_GPUBUFFER_H
