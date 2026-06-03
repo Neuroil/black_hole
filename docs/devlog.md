@@ -851,3 +851,26 @@ destroy swapchain image views
 编译零警告，程序运行时全链路输出正常，validation layer 无报错，clean exit。
 
 Stage 1 剩余：command pool、descriptor pool。
+
+## 2026-06-03 — Stage 1 收尾 + Stage 2 设计决策
+
+### 命名规范统一
+
+文件名统一为蛇形 (snake_case)：`vulkan_context.h`、`queue_family_indices.h`、`swap_chain_support_details.h` 等。架构文档已同步更新命名规范表。
+
+### VulkanContext 构造函数解耦
+
+将构造函数末尾 5 个内联块提取为独立辅助函数：
+- `cache_queue_family_index()` / `cache_memory_properties()` — 缓存硬件查询结果
+- `init_command_pool()` / `init_descriptor_pool()` / `init_pipeline_cache()` — 创建三类内部资源
+
+构造函数从 ~45 行精简到 13 行纯调用链。
+
+### GPUBuffer 设计决策：持有 context 指针
+
+GPUBuffer 不再单独持有裸 `VkDevice`，改为构造时存储 `const VulkanContext*`：
+- 析构时通过 `context_->device()` 获取 device
+- `upload_from_host()` 不再接收 `VkCommandPool` / `VkQueue` 参数——从 `context_` 内部获取
+- move 后指针置 `nullptr`，与 handle 的 `VK_NULL_HANDLE` 保持一致
+
+理由：消除多级组件各持一份 `VkDevice` 副本的问题，单一真相源通过 `VulkanContext` 统一访问。

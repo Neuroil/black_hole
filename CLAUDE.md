@@ -63,7 +63,8 @@ vulkan_util 工具命名空间 (纯函数)
 - **构建时编译 shader** —— CMake `add_custom_command` 调用 `glslc` 将 `.vert`/`.frag`/`.comp` 编译为 `.spv`。需要 Vulkan SDK 在 PATH 中。
 - **名词/动词严格分离** —— 资源类持有 VkHandle、不包含命令录制逻辑。CommandBuffer 是纯 Vulkan 指令封装，方法签名只有 `Vk*` 类型。上层编排代码即文档。
 - **RAII 全覆盖** —— 所有 VkHandle 由明确的 owner 类持有，构造创建、析构销毁、只允许 move。
-- **VulkanContext 是硬件查询的唯一入口** —— 其他组件通过 `const VulkanContext&` 获取 device、memory properties。
+- **VulkanContext 是硬件查询的唯一入口** —— 其他组件通过 `const VulkanContext&` 获取 device、memory properties。GPUBuffer / GPUImage 构造时持有 `const VulkanContext*`（move 可复位），不再单独存储裸 `VkDevice`。
+- **文件命名统一蛇形** —— 所有 `.h/.cpp` 文件名为全小写 + 下划线（`vulkan_context.h`、`queue_family_indices.h`）。
 - **Pipeline 配置用 struct + 默认值** —— `GraphicsPipelineConfig` 所有字段有合理默认值，调用方只填需要覆盖的字段。
 - **不做过度设计** —— 不为未来需求预拆组件。名词/动词分离的架构扩展时改编排逻辑即可，不动封装类。
 - **`docs/architecture.md` 是架构真相源** —— 完整组件接口、初始化/析构顺序、每帧伪代码、文件布局均在其中。`docs/devlog.md` 仅记录开发过程。

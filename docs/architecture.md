@@ -161,19 +161,17 @@ public:
     void  unmap();
 
     // 通过 staging buffer 上传数据（初始化期专用，内部同步等待）
-    void upload_from_host(const VulkanContext& context,
-                          const void* data,
+    void upload_from_host(const void* data,
                           VkDeviceSize offset,
-                          VkDeviceSize size,
-                          VkCommandPool command_pool,
-                          VkQueue queue);
+                          VkDeviceSize size);
 };
 ```
 
 **设计决策**：
+- 构造时持有 `const VulkanContext*` ——析构时通过 `context_->device()` 获取 device、`upload_from_host` 通过 `context_` 拿 command pool 和 queue，不再重复持有裸 `VkDevice`
 - 构造时通过 `VulkanContext::memory_properties()` 查询合适的内存类型，一步完成 buffer 创建 + 内存分配 + 绑定
-- `upload_from_host` 封装 staging buffer → vkCmdCopyBuffer → vkQueueWaitIdle 完整流程
-- 被 move 后的对象处于安全空状态（`VK_NULL_HANDLE`）
+- `upload_from_host` 封装 staging buffer → vkCmdCopyBuffer → vkQueueWaitIdle 完整流程，command pool / queue 从 `context_` 内部获取
+- 被 move 后的对象处于安全空状态（指针置 `nullptr`，handle 置 `VK_NULL_HANDLE`）
 - 本项目中的用途：vertex buffer（全屏四边形 6 顶点）、uniform buffer（相机/场景参数）、storage buffer（光线初始状态）
 
 ---
