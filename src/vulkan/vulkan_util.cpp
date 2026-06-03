@@ -110,4 +110,21 @@ VkCommandBuffer allocate_command_buffer(VkDevice device, VkCommandPool pool) {
     return cmd;
 }
 
+VkDescriptorPool create_descriptor_pool(VkDevice device, uint32_t max_sets,
+                                        const std::vector<VkDescriptorPoolSize>& pool_sizes,
+                                        VkDescriptorPoolCreateFlags flags) {
+    VkDescriptorPoolCreateInfo pool_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = flags,
+        .maxSets = max_sets,
+        .poolSizeCount = static_cast<uint32_t>(pool_sizes.size()),
+        .pPoolSizes = pool_sizes.data(),
+    };
+    VkDescriptorPool pool;
+    if (vkCreateDescriptorPool(device, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create descriptor pool!");
+    }
+    return pool;
+}
+
 } // namespace vulkan_util

@@ -8,7 +8,7 @@
 #include <vulkan/vulkan.h>
 #include <vector>
 
-struct SwapChainSupportDetails {
+struct swap_chain_support_details {
     VkSurfaceCapabilitiesKHR capabilities_;
     std::vector<VkSurfaceFormatKHR> formats_;
     std::vector<VkPresentModeKHR> present_modes_;

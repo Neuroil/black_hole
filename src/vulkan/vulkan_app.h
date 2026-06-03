@@ -5,7 +5,7 @@
 #ifndef BLACK_HOLE_PRAC_VULKANAPP_H
 #define BLACK_HOLE_PRAC_VULKANAPP_H
 
-#include "VulkanContext.h"
+#include "vulkan_context.h"
 #include <GLFW/glfw3.h>
 #include <memory>
 

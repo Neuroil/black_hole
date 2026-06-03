@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 // ============================================================
@@ -43,6 +44,11 @@ VkFence create_fence(VkDevice device, VkFenceCreateFlags flags);
 VkCommandPool create_command_pool(VkDevice device, uint32_t queue_family_index,
                                    VkCommandPoolCreateFlags flags);
 VkCommandBuffer allocate_command_buffer(VkDevice device, VkCommandPool pool);
+
+// ── Descriptor pool ──
+VkDescriptorPool create_descriptor_pool(VkDevice device, uint32_t max_sets,
+                                        const std::vector<VkDescriptorPoolSize>& pool_sizes,
+                                        VkDescriptorPoolCreateFlags flags);
 
 } // namespace vulkan_util
 

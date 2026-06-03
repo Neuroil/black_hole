@@ -2,7 +2,7 @@
 // Created by neuroil on 2026/6/1.
 //
 
-#include "VulkanContext.h"
+#include "vulkan_context.h"
 
 #include <algorithm>
 
@@ -45,7 +45,9 @@ void VulkanContext::init_window() {
 }
 
 bool VulkanContext::check_validation_layer_support() {
+#ifndef NDEBUG
     std::cout << "Now checking the validation layers..." << std::endl;
+#endif
     uint32_t layer_count;
     vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
 
@@ -108,12 +110,17 @@ void VulkanContext::create_vulkan_instance() {
     };
 
     VkResult result = vkCreateInstance(&create_info, nullptr, &instance_);
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error("failed to create Vulkan instance!");
+    }
 }
 
 
 void VulkanContext::setup_debug_messenger() {
     if (!enable_validation_layers) return;
+#ifndef NDEBUG
     std::cout << "Done.\nNow setting up the debug messenger..." << std::endl;
+#endif
     VkDebugUtilsMessengerCreateInfoEXT create_info{
         .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
         .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
@@ -132,12 +139,12 @@ void VulkanContext::setup_debug_messenger() {
 }
 
 bool VulkanContext::is_physical_device_ok(VkPhysicalDevice physical_device) {
-    QueueFamilyIndices indices = find_queue_families(physical_device);
+    queue_family_indices indices = find_queue_families(physical_device);
 
     bool extension_support = check_device_extension_support(physical_device);
     bool swap_chain_adequate = false;
     if (extension_support) {
-        SwapChainSupportDetails swapChainSupport = query_swap_chain_support(physical_device);
+        swap_chain_support_details swapChainSupport = query_swap_chain_support(physical_device);
         swap_chain_adequate = !swapChainSupport.formats_.empty() && !swapChainSupport.present_modes_.empty();
     }
 
@@ -161,7 +168,9 @@ bool VulkanContext::check_device_extension_support(VkPhysicalDevice physical_dev
 }
 
 void VulkanContext::pickup_physical_device() {
+#ifndef NDEBUG
     std::cout << "Done.\nNow picking up the physical device..." << std::endl;
+#endif
     uint32_t physical_device_count = 0;
     vkEnumeratePhysicalDevices(instance_, &physical_device_count, nullptr);
     if (physical_device_count == 0) throw std::runtime_error("failed to find GPUs with Vulkan support!");
@@ -179,9 +188,11 @@ void VulkanContext::pickup_physical_device() {
     if (physical_device_ == VK_NULL_HANDLE) throw std::runtime_error("there's no suitable GPU!");
 }
 
-QueueFamilyIndices VulkanContext::find_queue_families(VkPhysicalDevice physical_device) {
+queue_family_indices VulkanContext::find_queue_families(VkPhysicalDevice physical_device) {
+#ifndef NDEBUG
     std::cout << "...finding the queue families..." << std::endl;
-    QueueFamilyIndices indices;
+#endif
+    queue_family_indices indices;
 
     uint32_t queue_family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nullptr);
@@ -232,16 +243,20 @@ QueueFamilyIndices VulkanContext::find_queue_families(VkPhysicalDevice physical_
 }
 
 void VulkanContext::create_surface() {
+#ifndef NDEBUG
     std::cout << "Done.\nNow creating the window surface..." << std::endl;
+#endif
     if (glfwCreateWindowSurface(instance_, window_, nullptr, &surface_) != VK_SUCCESS) {
         throw std::runtime_error("failed to create window surface!");
     }
 }
 
 void VulkanContext::create_logical_device() {
+#ifndef NDEBUG
     std::cout << "Done.\nNow creating the logical device..." << std::endl;
+#endif
 
-    QueueFamilyIndices indices = find_queue_families(physical_device_);
+    queue_family_indices indices = find_queue_families(physical_device_);
 
     // 去重
     std::set<uint32_t> unique_families = {
@@ -286,8 +301,8 @@ void VulkanContext::create_logical_device() {
     vkGetDeviceQueue(device_, indices.present_family_.value(), 0, &present_queue_);
 }
 
-SwapChainSupportDetails VulkanContext::query_swap_chain_support(VkPhysicalDevice device) {
-    SwapChainSupportDetails details;
+swap_chain_support_details VulkanContext::query_swap_chain_support(VkPhysicalDevice device) {
+    swap_chain_support_details details;
 
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, surface_, &details.capabilities_);
 
@@ -353,8 +368,10 @@ VkExtent2D VulkanContext::choose_swap_extent(const VkSurfaceCapabilitiesKHR& cap
 }
 
 void VulkanContext::create_swap_chain() {
+#ifndef NDEBUG
     std::cout << "Done.\nNow creating swap chain..." << std::endl;
-    SwapChainSupportDetails swap_chain_support_details = query_swap_chain_support(physical_device_);
+#endif
+    swap_chain_support_details swap_chain_support_details = query_swap_chain_support(physical_device_);
 
     VkSurfaceFormatKHR surface_format = choose_swap_surface_format(swap_chain_support_details.formats_);
     VkPresentModeKHR present_mode = choose_swap_present_mode(swap_chain_support_details.present_modes_);
@@ -378,7 +395,7 @@ void VulkanContext::create_swap_chain() {
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
     };
 
-    QueueFamilyIndices indices = find_queue_families(physical_device_);
+    queue_family_indices indices = find_queue_families(physical_device_);
     uint32_t queueFamilyIndices[] = {indices.graphic_family_.value(), indices.present_family_.value()};
 
     if (indices.graphic_family_ != indices.present_family_) {
@@ -409,7 +426,9 @@ void VulkanContext::create_swap_chain() {
 }
 
 void VulkanContext::create_image_views() {
+#ifndef NDEBUG
     std::cout << "Done.\nNow creating image views..." << std::endl;
+#endif
     swap_chain_image_views_.resize(swap_chain_images_.size());
     for (size_t i = 0; i < swap_chain_images_.size(); i++) {
         VkImageViewCreateInfo create_info{};
@@ -433,6 +452,116 @@ void VulkanContext::create_image_views() {
     }
 }
 
+void VulkanContext::cache_queue_family_index() {
+    queue_family_indices indices = find_queue_families(physical_device_);
+    graphics_queue_family_index_ = indices.graphic_family_.value();
+}
+
+void VulkanContext::cache_memory_properties() {
+    vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties_);
+}
+
+void VulkanContext::init_command_pool() {
+    command_pool_ = vulkan_util::create_command_pool(
+        device_, graphics_queue_family_index_,
+        VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+}
+
+void VulkanContext::init_descriptor_pool() {
+    std::vector<VkDescriptorPoolSize> pool_sizes = {
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 10},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10},
+    };
+    descriptor_pool_ = vulkan_util::create_descriptor_pool(
+        device_, 10, pool_sizes, 0);
+}
+
+void VulkanContext::init_pipeline_cache() {
+    VkPipelineCacheCreateInfo cache_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+    };
+    if (vkCreatePipelineCache(device_, &cache_info, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create pipeline cache!");
+    }
+}
+
+// ##########################################################
+
+// ── 硬件查询 ──
+
+VkInstance VulkanContext::instance() const { return instance_; }
+VkPhysicalDevice VulkanContext::physical_device() const { return physical_device_; }
+VkDevice VulkanContext::device() const { return device_; }
+VkSurfaceKHR VulkanContext::surface() const { return surface_; }
+
+VkQueue VulkanContext::graphics_queue() const { return graphics_queue_; }
+VkQueue VulkanContext::compute_queue() const { return compute_queue_; }
+VkQueue VulkanContext::presentation_queue() const { return present_queue_; }
+uint32_t VulkanContext::queue_family_index() const { return graphics_queue_family_index_; }
+
+// ── Swapchain 查询 ──
+
+VkSwapchainKHR VulkanContext::swapchain() const { return swap_chain_; }
+VkImageView VulkanContext::swapchain_view(uint32_t i) const { return swap_chain_image_views_[i]; }
+uint32_t VulkanContext::swapchain_view_count() const { return static_cast<uint32_t>(swap_chain_image_views_.size()); }
+VkFormat VulkanContext::swapchain_format() const { return swap_chain_image_format_; }
+VkExtent2D VulkanContext::swapchain_extent() const { return swap_chain_extent_; }
+
+VkPipelineCache VulkanContext::pipeline_cache() const { return pipeline_cache_; }
+VkDescriptorPool VulkanContext::descriptor_pool() const { return descriptor_pool_; }
+
+uint32_t VulkanContext::window_width() const { return WIDTH; }
+uint32_t VulkanContext::window_height() const { return HEIGHT; }
+
+const VkPhysicalDeviceMemoryProperties& VulkanContext::memory_properties() const { return memory_properties_; }
+
+// ── Command buffer 分配 ──
+
+VkCommandBuffer VulkanContext::allocate_command_buffer() {
+    return vulkan_util::allocate_command_buffer(device_, command_pool_);
+}
+
+void VulkanContext::reset_command_pool() {
+    vkResetCommandPool(device_, command_pool_, 0);
+}
+
+// ── Swapchain frame loop (阶段五实现) ──
+
+uint32_t VulkanContext::acquire_next_image(VkSemaphore signal_semaphore) {
+    uint32_t image_index;
+    vkAcquireNextImageKHR(device_, swap_chain_, UINT64_MAX, signal_semaphore, VK_NULL_HANDLE, &image_index);
+    return image_index;
+}
+
+void VulkanContext::submit(VkCommandBuffer cmd, VkSemaphore wait, VkSemaphore signal) {
+    VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+    VkSubmitInfo submit_info{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &wait,
+        .pWaitDstStageMask = wait_stages,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &signal,
+    };
+    vkQueueSubmit(graphics_queue_, 1, &submit_info, VK_NULL_HANDLE);
+}
+
+void VulkanContext::present(uint32_t image_index, VkSemaphore wait_semaphore) {
+    VkPresentInfoKHR present_info{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &wait_semaphore,
+        .swapchainCount = 1,
+        .pSwapchains = &swap_chain_,
+        .pImageIndices = &image_index,
+    };
+    vkQueuePresentKHR(present_queue_, &present_info);
+}
+
+
 // ##########################################################
 
 VulkanContext::VulkanContext(uint32_t w, uint32_t h) : WIDTH(w), HEIGHT(h) {
@@ -444,12 +573,34 @@ VulkanContext::VulkanContext(uint32_t w, uint32_t h) : WIDTH(w), HEIGHT(h) {
     create_logical_device();
     create_swap_chain();
     create_image_views();
+    cache_queue_family_index();
+    cache_memory_properties();
+    init_command_pool();
+    init_descriptor_pool();
+    init_pipeline_cache();
 }
 
 VulkanContext::~VulkanContext() {
-    vkDestroySwapchainKHR(device_, swap_chain_, nullptr);
+    // 等待 GPU 完成任务
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
+    }
+
+    // 逆序析构
+    if (device_ != VK_NULL_HANDLE) {
+        if (pipeline_cache_ != VK_NULL_HANDLE) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
+        if (descriptor_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
+        if (command_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, command_pool_, nullptr);
+    }
+
+    // 析构 swap_chain_image_views
+    for (auto view : swap_chain_image_views_) {
+        vkDestroyImageView(device_, view, nullptr);
+    }
+
+    vkDestroySwapchainKHR(device_, swap_chain_, nullptr);
+
+    if (device_ != VK_NULL_HANDLE) {
         vkDestroyDevice(device_, nullptr);
     }
     if (surface_ != VK_NULL_HANDLE) vkDestroySurfaceKHR(instance_, surface_, nullptr);

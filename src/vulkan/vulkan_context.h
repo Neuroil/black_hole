@@ -12,8 +12,8 @@
 #include <vector>
 #include <glm/ext/scalar_uint_sized.hpp>
 #include <vulkan/vulkan.h>
-#include "QueueFamilyIndices.h"
-#include "SwapChainSupportDetails.h"
+#include "queue_family_indices.h"
+#include "swap_chain_support_details.h"
 
 const std::vector<const char*> validation_layers = {"VK_LAYER_KHRONOS_validation"};
 
@@ -55,6 +55,12 @@ class VulkanContext {
     VkExtent2D swap_chain_extent_;
     std::vector<VkImageView> swap_chain_image_views_;
 
+    uint32_t graphics_queue_family_index_ = 0;
+    VkPhysicalDeviceMemoryProperties memory_properties_{};
+    VkCommandPool command_pool_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+
     // ============== helper ==============
     void init_window();
     bool check_validation_layer_support();
@@ -62,15 +68,20 @@ class VulkanContext {
     bool is_physical_device_ok(VkPhysicalDevice physical_device);
     bool check_device_extension_support(VkPhysicalDevice physical_device);
     void pickup_physical_device();
-    QueueFamilyIndices find_queue_families(VkPhysicalDevice device);
+    queue_family_indices find_queue_families(VkPhysicalDevice device);
     void create_surface();
     void create_logical_device();
-    SwapChainSupportDetails query_swap_chain_support(VkPhysicalDevice device);
+    swap_chain_support_details query_swap_chain_support(VkPhysicalDevice device);
     VkSurfaceFormatKHR choose_swap_surface_format(const std::vector<VkSurfaceFormatKHR>& available_formats);
     VkPresentModeKHR choose_swap_present_mode(const std::vector<VkPresentModeKHR>& available_present_modes);
     VkExtent2D choose_swap_extent(const VkSurfaceCapabilitiesKHR& capabilities);
     void create_swap_chain();
     void create_image_views();
+    void cache_queue_family_index();
+    void cache_memory_properties();
+    void init_command_pool();
+    void init_descriptor_pool();
+    void init_pipeline_cache();
 
     // ============== debuger ==============
     std::vector<const char*> get_required_extensions();

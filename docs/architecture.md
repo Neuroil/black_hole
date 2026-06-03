@@ -627,6 +627,7 @@ blackhole_prac/
 
 | 元素 | 风格 | 示例 |
 |------|------|------|
+| 文件 | 蛇形 (snake_case) | `vulkan_context.h`, `queue_family_indices.h` |
 | 类 / struct | 大驼峰 (PascalCase) | `VulkanContext`, `GraphicsPipelineConfig` |
 | 函数 / 方法 | 蛇形 (snake_case) | `create_shader_module()`, `allocate_command_buffer()` |
 | lambda | 蛇形 (snake_case) | `auto upload_data = [&]() { ... }` |

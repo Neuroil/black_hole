@@ -2,7 +2,7 @@
 // Created by neuroil on 2026/6/1.
 //
 
-#include "VulkanApp.h"
+#include "vulkan_app.h"
 
 VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr){
     context_ = std::make_unique<VulkanContext>(w,h);

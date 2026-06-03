@@ -7,11 +7,10 @@
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/vec4.hpp>
-#include <glm/mat4x4.hpp>
 
 #include <iostream>
 
-#include "vulkan/VulkanApp.h"
+#include "vulkan/vulkan_app.h"
 
 #define WIDTH 800
 #define HEIGHT 600
