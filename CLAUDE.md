@@ -17,6 +17,28 @@ cmake --build build/debug
 
 There are no tests or linting setup yet.
 
+## Development workflow（强制约束）
+
+**所有规划、调研、代码编写、文档编辑必须遵循 `~/.claude/skills/` 中定义的 work 五段流水线**：
+
+```
+/work-recall (三派 recall: archival + codebase + web)
+  → /work-plan (scout deep 摸底 → 方向选择 → sensei 拍板)
+  → /work-research (external research + lock-design + OCP review)
+  → /work-delegate (blueprint → implementation agents → code review)
+  → /work-summarize (knowledge distill + 收尾)
+```
+
+**主对话只做编排、决策、落盘 archival**。主对话禁止直接：
+- `Read` / `Glob` / `Grep` 源代码（派 agent）
+- `Read` `knowledge/` 内容文件（派 `work-archival-recall`）
+- `WebSearch` / `WebFetch`（派 `work-web-recall` 或 `work-external-research`）
+- `Edit` / `Write` 任何仓库文件（派 implementation agent）——包括 `docs/*.md`、`CLAUDE.md`
+
+唯一例外：sensei 明确说"你自己改"时可直接操作。
+
+**零归档 + 零状态**：流水线不写 tasks / INDEX / research / history 文件。产物通过 agent return 或 SendMessage 回主对话 in-session 持有。
+
 ## Architecture
 
 > **架构真相源**：`docs/architecture.md`。以下为摘要，完整设计（组件接口、所有权关系、初始化/析构顺序、每帧伪代码、文件布局、开发阶段）见该文件。
@@ -44,9 +66,16 @@ vulkan_util 工具命名空间 (纯函数)
 - 不用 VkRenderPass / VkFramebuffer（Vulkan 1.3 Dynamic Rendering）
 - 不做过度设计：当前一个 compute pipeline、一个 graphics pipeline、一个 storage image——不预拆子组件
 
-**数据流**：CPU 生成光线初始状态 → upload → GPU compute (geodesic.comp) → storage image → pipeline barrier → GPU graphics (全屏四边形, Dynamic Rendering) → swapchain present
+**数据流**（三阶段管线）：
+```
+[阶段一 CPU] GLFW 输入 → 更新 CameraUBO + SpacetimeUBO → upload
+  → [阶段二 GPU Compute] geodesic.comp: 每像素测地线积分 (RK4, Christoffel 实时计算)
+    → 终止判定 (捕获/逃逸/盘面) → imageStore 写 Storage Image
+  → [Barrier: COMPUTE → FRAGMENT]
+  → [阶段三 GPU Graphics] fragment shader 读取 Storage Image → 呈递到 swapchain
+```
 
-**初始化顺序**：GLFW window → VulkanContext → GPUBuffer×3 → GPUImage → descriptor sets → pipeline layouts → ComputePipeline → GraphicsPipeline → Semaphore×2
+**初始化顺序**：GLFW window → VulkanContext → GPUBuffer (多个 UBO/SSBO) → GPUImage → descriptor sets → pipeline layouts → ComputePipeline → GraphicsPipeline → Semaphore×2
 
 **组件清单**（`src/vulkan/`，头文件与源文件同目录）：
 `vulkan_util.h/.cpp` / `vulkan_context.h/.cpp` / `gpu_buffer.h/.cpp` / `gpu_image.h/.cpp` / `compute_pipeline.h/.cpp` / `graphics_pipeline.h/.cpp` / `command_buffer.h/.cpp` / `vulkan_app.h/.cpp`
@@ -71,7 +100,8 @@ vulkan_util 工具命名空间 (纯函数)
 
 ## Tool usage
 
-- **文件修改**：所有源代码改动必须派 sub-agent（遵循 work skill 五段流水线：recall → scout → research → delegate → summarize），主对话只编排不亲自改代码。唯一例外：sensei 明确说"你自己改"时可直接操作。文档（`docs/*.md`、`CLAUDE.md`）的更新同样适用此规则。使用 `Read` / `Edit` / `Write` 工具，不得通过 Bash 调用 `sed` / `awk` / `perl` 等文本处理命令修改仓库文件。
+- **skills**：所有开发操作（规划、调研、写代码、改文档、审查）**必须**遵循 `~/.claude/skills/` 中的 work 五段流水线。`skills/` 目录是开发规范的唯一入口。违反此规则直接回退重做。
+- **文件修改**：派 sub-agent 完成（work 流水线 Stage 4: delegate → implementation agents）。主对话只编排不亲自改文件。唯一例外：sensei 明确说"你自己改"时可直接操作。严禁通过 Bash 调用 `sed` / `awk` / `perl` 等文本处理命令修改仓库文件。
 - **文件搜索**：使用 `Glob` 或 Bash `find` 查找文件，使用 LSP（`findReferences` / `goToDefinition` / `hover`）查找符号引用和定义。Bash `grep` 仅用于快速定位行号，不用于批量替换。
 - **Bash**：专用于构建（cmake / ninja）、运行、git 操作、文件列表（`find` / `ls`）、项目状态查询。
 - **并发**：相互独立的工具调用应在单次响应中并行发出，减少往返延迟。
@@ -85,7 +115,7 @@ vulkan_util 工具命名空间 (纯函数)
 |------|------|------|
 | Stage 1 | VulkanContext + vulkan_util: instance, device, validation layers, debug messenger, surface, swapchain (Dynamic Rendering), command pool, descriptor pool | **完成** — instance ✓, validation layers ✓, debug messenger ✓, surface ✓, physical device ✓, logical device + 3 queues ✓, vulkan_util (8个纯函数) ✓, swapchain ✓, image views ✓, memory properties ✓, command pool ✓, descriptor pool ✓, pipeline cache ✓, queue_family_index ✓, swapchain frame loop stubs (acquire/submit/present) ✓, 所有 getter 实现 ✓ |
 | Stage 2 | GPUBuffer + GPUImage: RAII buffer 和 image 包装, staging upload, layout transition + barrier | **完成** — GPUBuffer ✓, GPUImage ✓ |
-| Stage 3 | ComputePipeline + GraphicsPipeline: RAII pipeline 包装, GraphicsPipelineConfig (VkPipelineRenderingCreateInfo) | 待实现 |
+| Stage 3 | ComputePipeline + GraphicsPipeline: RAII pipeline 包装, GraphicsPipelineConfig (VkPipelineRenderingCreateInfo) | **完成** — ComputePipeline ✓, GraphicsPipeline ✓, GraphicsPipelineConfig (VkPipelineRenderingCreateInfo) ✓, shader 编译规则（glslc → .spv）✓, shader_base 管线加载测试通过 ✓ |
 | Stage 4 | CommandBuffer: 通用命令缓冲包装 (begin/end, bind_pipeline, bind_descriptor_sets, dispatch, begin_rendering/end_rendering, draw, pipeline_barrier) | 待实现 |
 | Stage 5 | VulkanApp: 顶层编排, 组件持有与初始化, 每帧 Dynamic Rendering 流程 | 待实现 |
 | Stage 6 | 物理基础验证 (CPU 端): Kerr 度规, Christoffel, RK4/RK45, 守恒量测试 | 待实现 |
@@ -94,10 +124,12 @@ vulkan_util 工具命名空间 (纯函数)
 
 ## Planning workflow
 
-当用户要求规划下一阶段的开发时：
+当用户要求规划下一阶段的开发时，**必须**走 work 流水线：
 
-1. **只读分析**：阅读当前源文件以理解代码库状态。不要修改任何代码。
-2. **更新 docs/devlog.md**：在 `docs/devlog.md` 末尾追加新阶段计划，遵循已有格式（时间戳标题 `## YYYY-MM-DD`，然后是目标、设计理由、文件变更、关键要点、验证方法等部分）。
-3. **向用户汇报**：输出简洁的总结，说明计划内容。
+1. `/work-recall` — 三派并行的 recall（archival + codebase + web），获取知识/代码库/网络摘要
+2. `/work-plan` — scout deep 摸底 → 方向选择（AskUserQuestion，必停）→ sensei 拍板
+3. `/work-research` — external research + lock-design（锁定设计规约 + OCP 自评）+ 必要时 ocp-review
+4. 设计锁定后，由 implementation agent 更新 `docs/devlog.md` 和 `CLAUDE.md`
+5. 向用户汇报规划结果
 
-**重要**：规划阶段只能修改 `docs/devlog.md` 和 `CLAUDE.md`。在用户明确要求实现之前，不得修改 `include/` 和 `src/` 下的源文件。
+**重要**：规划阶段不得修改 `include/` 和 `src/` 下的源文件。文档更新也必须派 agent，主对话不直接编辑。

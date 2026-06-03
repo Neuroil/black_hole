@@ -891,3 +891,43 @@ GPUBuffer 不再单独持有裸 `VkDevice`，改为构造时存储 `const Vulkan
 - move 构造/赋值：逐成员转移 + 源置空，禁止拷贝
 - barrier：`create_barrier()` 纯查询 / `transition_barrier()` 同步更新布局追踪
 - 异常安全：构造每步失败自清理已创建资源
+
+---
+
+## 2026-06-03 — 架构修正：数据流与渲染管线
+
+### 背景
+
+原架构文档中数据流描述存在误解：将 compute shader 的输出视为"纹理"，通过全屏四边形采样后贴到 swapchain。实际流程为三阶段管线，compute shader 执行弯曲时空测地线积分，graphics pipeline 仅负责屏幕呈递。
+
+### 修正后的三阶段管线
+
+```
+[阶段一 CPU] GLFW 输入 → 更新 CameraUBO + SpacetimeUBO → upload
+  → [阶段二 GPU Compute] geodesic.comp: 每像素测地线积分
+    ├ CameraUBO → 初始光线 x^μ, p^μ (Boyer-Lindquist 坐标)
+    ├ SpacetimeUBO → M, a → 实时计算 Christoffel → RK4 步进
+    ├ 坐标转换 BL ↔ 局部欧几里得 (相交检测用)
+    └ 终止判定 + imageStore 写 Storage Image
+  → [Barrier: COMPUTE → FRAGMENT]
+  → [阶段三 GPU Graphics] fragment shader 读取 Storage Image → 呈递到 swapchain
+```
+
+### 关键设计澄清
+
+| 方面 | 旧描述（错误） | 新描述（正确） |
+|------|--------------|--------------|
+| GPU 计算输出 | "纹理"（被采样） | 每像素测地线积分结果 |
+| 相交检测 | 未定义 | 解析式判定 (r ≤ r_horizon, θ = π/2) |
+| 坐标空间 | 隐含欧几里得 | BL 弯曲坐标 ↔ 局部欧几里得转换（compute 内部） |
+| GPUBuffer | 具体写死 ×3 | 泛化"多个 UBO / SSBO，具体由 VulkanApp 决定" |
+| GraphicsPipeline | "全屏四边形采样" | presentation pass（fragment 读取 compute 结果 → swapchain） |
+
+### 不用硬件光追
+
+VK_KHR_ray_tracing_pipeline / VK_KHR_ray_query 假设光线直线传播，弯曲测地线下无加速收益。解析式求交在当前场景 O(1) 优于 BVH。
+
+### 文件变更
+
+- `docs/architecture.md` — 概述/数据流/GPUBuffer/GPUImage/GraphicsPipeline/VulkanApp/step_frame/所有权/初始化顺序 全面修正
+- `CLAUDE.md` — 架构摘要同步，新增 Development workflow 强制约束段

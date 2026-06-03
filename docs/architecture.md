@@ -4,7 +4,7 @@
 
 ## 概述
 
-基于 Vulkan 1.3 的广义相对论克尔黑洞光线追踪仿真器。测地线积分运行在 GPU compute shader 上——CPU 端积分器仅用于验证算法正确性（守恒量测试、解析解对标），验证通过后移植到 GLSL compute shader。所有渲染通过 Vulkan 完成（Dynamic Rendering + compute pipeline），GLFW 仅负责窗口管理和输入。
+基于 Vulkan 1.3 的广义相对论克尔黑洞光线追踪仿真器。渲染采用三阶段管线：CPU 准备（相机更新 + UBO 上传）→ GPU Compute Pass（geodesic.comp 每像素并行积分测地线，写 Storage Image）→ GPU Graphics Pass（fragment shader 读取 Storage Image 呈递到 swapchain）。CPU 端积分器仅用于验证算法正确性（守恒量测试、解析解对标），不进入运行时热路径。所有渲染通过 Vulkan 完成（Dynamic Rendering + compute pipeline），GLFW 仅负责窗口管理和输入。
 
 架构采用 **RAII 分层 + 名词/动词分离**，从底到顶：
 
@@ -24,8 +24,9 @@
 └───────────────────────────────────────────────────────────────┘
 
 [物理层 — 独立于 Vulkan 抽象]
-Camera (ZAMO tetrad) → Scene (黑洞参数, 吸积盘)
-  → CPU Integrator (验证用) → GPU geodesic.comp (运行时)
+Camera (ZAMO tetrad) → Scene (黑洞参数 M, a, 吸积盘)
+  → CPU Integrator (验证用) → GPU geodesic.comp (运行时，计算 Christoffel、
+     积分测地线、终止判定、颜色映射)
 ```
 
 ## 设计哲学
@@ -166,14 +167,14 @@ public:
 - 构造时持有 `const VulkanContext*` ——析构时通过 `context_->device()` 获取 device，不再重复持有裸 `VkDevice`
 - 构造时通过 `VulkanContext::memory_properties()` 查询合适的内存类型，一步完成 buffer 创建 + 内存分配 + 绑定
 - 被 move 后的对象处于安全空状态（指针置 `nullptr`，handle 置 `VK_NULL_HANDLE`）
-- 本项目中的用途：vertex buffer（待渲染对象）、uniform buffer（相机/场景参数）、storage buffer（储存 `compute_pipeline` 所需数据）
+- 本项目中的用途：多种 GPUBuffer（UBO、SSBO 等），具体数量和用途由 VulkanApp 编排决定
 > 不提供 `upload_from_host` —— staging upload 是上层编排职责，不属于 buffer RAII 容器。GPUBuffer 只提供 `map()` / `unmap()`（host-visible buffer），数据上传由 VulkanApp 或独立动词类编排
 
 ---
 
 ### 4. GPUImage — VkImage RAII 包装
 
-**职责**：封装 VkImage + VkImageView + VkDeviceMemory，追踪当前布局，提供 barrier 辅助方法。黑洞仿真中 storage image（Compute Write → Graphics Read）是核心数据通道。
+**职责**：封装 VkImage + VkImageView + VkDeviceMemory，追踪当前布局，提供 barrier 辅助方法。黑洞仿真中 storage image 是 compute pass 与 graphics pass 之间的数据通道（compute shader 写入颜色 → fragment shader 读取并输出到 swapchain）。
 
 ```cpp
 class GPUImage {
@@ -221,7 +222,7 @@ private:
 - 不内置 VMA（Vulkan Memory Allocator）——先用手动 `vkAllocateMemory`，后续按需引入
 - `create_barrier()` 不修改内部状态（纯查询），`transition_barrier()` 同步更新布局追踪
 - barrier 的执行由 CommandBuffer::pipeline_barrier 负责——GPUImage 不直接操作命令流（名词/动词分离）
-- 本项目用途：storage image（`VK_FORMAT_R32G32B32A32_SFLOAT`，`VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT`）
+- 本项目用途：storage image（compute shader 写入 → fragment shader 读取），format 由 VulkanApp 决定
 
 ---
 
@@ -304,7 +305,7 @@ public:
 - **没有** `VkRenderPass render_pass` 字段：使用 `VkPipelineRenderingCreateInfo`（pNext 链）传入颜色格式列表
 - 内部自动从 `color_attachment_formats` 构建 `VkPipelineRenderingCreateInfo`，附加到 `VkGraphicsPipelineCreateInfo::pNext`
 - 配置结构体所有字段有合理默认值，本项目场景只需填 shader 路径、color_attachment_formats、viewport_extent、vertex layout
-- 本项目用于渲染全屏四边形（采样 storage image → swapchain）
+- 本项目用途：presentation pass —— fragment shader 读取 storage image（compute 输出），写入 swapchain color attachment（Dynamic Rendering）。顶点数据的生成方式为实现细节，不在此设计层规定
 
 ---
 
@@ -383,18 +384,17 @@ private:
 
     // ── 名词层：所有 GPU 资源 ──
     std::unique_ptr<VulkanContext>    context_;
-    std::unique_ptr<GPUBuffer>        vertex_buffer_;         // 全屏四边形 (6 vertices)
-    std::unique_ptr<GPUBuffer>        uniform_buffer_;        // 相机 + 场景参数 UBO
-    std::unique_ptr<GPUBuffer>        ray_buffer_;            // 光线初始状态 storage buffer
-    std::unique_ptr<GPUImage>         storage_image_;         // 黑洞画布: Compute Write → Graphics Read
+    std::unique_ptr<GPUBuffer>        ubo_buffers_;           // 多种 UBO / SSBO（CameraUBO, SpacetimeUBO 等），
+                                                              // 具体数量和类型由 VulkanApp 编排决定
+    std::unique_ptr<GPUImage>         storage_image_;         // Compute Write → Graphics Read 数据通道
     std::unique_ptr<ComputePipeline>  compute_pipeline_;      // geodesic.comp
-    std::unique_ptr<GraphicsPipeline> graphics_pipeline_;     // 全屏四边形采样 → swapchain
+    std::unique_ptr<GraphicsPipeline> graphics_pipeline_;     // presentation pass → swapchain
 
     // 少数裸 handle（量太少，不值得单独包装类；VulkanApp 负责生命周期）
     VkDescriptorSetLayout compute_descriptor_set_layout_;
-    VkDescriptorSet       compute_descriptor_set_;            // bind: ray buffer + storage image + UBO
+    VkDescriptorSet       compute_descriptor_set_;
     VkDescriptorSetLayout graphics_descriptor_set_layout_;
-    VkDescriptorSet       graphics_descriptor_set_;            // bind: storage image sampler
+    VkDescriptorSet       graphics_descriptor_set_;
     VkPipelineLayout      compute_pipeline_layout_;
     VkPipelineLayout      graphics_pipeline_layout_;
     VkSemaphore           image_available_semaphore_;
@@ -410,15 +410,16 @@ private:
 
 ```cpp
 void VulkanApp::step_frame() {
-    // 0. 准备
+    // ═══════════ 阶段一：CPU 端准备 ═══════════
     context_->reset_command_pool();
-    update_uniform_buffer_and_ray_data();
+    // GLFW 捕获输入 → 更新 Camera 状态 → 将 CameraUBO / SpacetimeUBO 写入 GPUBuffer
+    update_ubos();
 
     CommandBuffer cmd(context_->allocate_command_buffer());
     cmd.begin();
 
-    // ═══════════ PASS 1: COMPUTE ═══════════
-    // Storage image: UNDEFINED → GENERAL (compute write)
+    // ═══════════ 阶段二：GPU Compute Pass（测地线积分） ═══════════
+    // Storage image: UNDEFINED → GENERAL (compute shader 写入)
     cmd.pipeline_barrier(
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, {},
@@ -428,11 +429,13 @@ void VulkanApp::step_frame() {
     cmd.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline_->pipeline());
     cmd.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE,
                               compute_pipeline_layout_, 0, { compute_descriptor_set_ });
+    // 每像素一个 work item：CameraUBO 生成初始光线 → RK4 积分（查 SpacetimeUBO 计算 Christoffel）
+    // → 终止判定（捕获/逃逸/盘面命中）→ imageStore 写 Storage Image
     cmd.dispatch(ceil_div(context_->window_width(),  16),
                  ceil_div(context_->window_height(), 16), 1);
 
-    // ═══════════ PASS 2: GRAPHICS (Dynamic Rendering) ═══════════
-    // Storage image: GENERAL → SHADER_READ_ONLY_OPTIMAL (fragment shader sample)
+    // ═══════════ 阶段三：GPU Graphics Pass（屏幕呈递） ═══════════
+    // Storage image: GENERAL → SHADER_READ_ONLY_OPTIMAL (fragment shader 读取)
     cmd.pipeline_barrier(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, {},
@@ -442,32 +445,34 @@ void VulkanApp::step_frame() {
 
     uint32_t image_index = context_->acquire_next_image(image_available_semaphore_);
 
-    VkRenderingInfo rendering_info = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea = {{0, 0}, context_->swapchain_extent()},
-        .layerCount = 1,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &(VkRenderingAttachmentInfo{
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = context_->swapchain_view(image_index),
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = {{{0.0f, 0.0f, 0.0f, 1.0f}}}
-        }),
-    };
+    // 使用具名临时变量（C++ 不允许 composite literal 取地址）
+    VkRenderingAttachmentInfo color_attachment = {};
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment.imageView = context_->swapchain_view(image_index);
+    color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color_attachment.clearValue = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
+
+    VkRenderingInfo rendering_info = {};
+    rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering_info.renderArea = {{0, 0}, context_->swapchain_extent()};
+    rendering_info.layerCount = 1;
+    rendering_info.colorAttachmentCount = 1;
+    rendering_info.pColorAttachments = &color_attachment;
+
     cmd.begin_rendering(rendering_info);
 
+    // Fragment shader 读取 Storage Image → 输出到 swapchain（当前直通，后续可在此加后处理）
     cmd.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_->pipeline());
     cmd.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                               graphics_pipeline_layout_, 0, { graphics_descriptor_set_ });
-    cmd.bind_vertex_buffer(vertex_buffer_->buffer());
-    cmd.draw(6);
+    cmd.draw(vertex_count);
 
     cmd.end_rendering();
     cmd.end();
 
-    // 3. 提交与呈现（semaphore 同步）
+    // 提交与呈现（semaphore 同步）
     context_->submit(cmd.handle(), image_available_semaphore_, render_finished_semaphore_);
     context_->present(image_index, render_finished_semaphore_);
 }
@@ -479,8 +484,8 @@ void VulkanApp::step_frame() {
 
 ```
 VulkanApp ──owns──► VulkanContext
-                 ├─ GPUBuffer × 3 (vertex + uniform + ray storage)
-                 ├─ GPUImage  × 1 (storage image — 黑洞画布)
+                 ├─ GPUBuffer (多个 UBO / SSBO，具体数量和类型由 VulkanApp 决定)
+                 ├─ GPUImage  (storage image — compute → graphics 数据通道)
                  ├─ ComputePipeline
                  ├─ GraphicsPipeline
                  ├─ VkDescriptorSetLayout × 2 (raw)
@@ -498,17 +503,15 @@ CommandBuffer ── 临时对象，每帧从 VulkanContext command pool 分配�
 ```
  1. GLFW window
  2. VulkanContext              ─── 底层硬件全部就绪（含 command pool, descriptor pool）
- 3. GPUBuffer (vertex)         ─── 全屏四边形顶点数据 + upload
- 4. GPUBuffer (uniform)        ─── 相机/场景 UBO
- 5. GPUBuffer (ray storage)    ─── 光线初始状态 storage buffer
- 6. GPUImage (storage)         ─── 黑洞画布
- 7. 创建 compute descriptor set layout + 分配 descriptor set + 更新
- 8. 创建 compute pipeline layout
- 9. ComputePipeline            ─── geodesic.comp
-10. 创建 graphics descriptor set layout + 分配 descriptor set
-11. 创建 graphics pipeline layout
-12. GraphicsPipeline           ─── 全屏四边形采样（Dynamic Rendering, 传 swapchain format）
-13. 创建 2 个 VkSemaphore
+ 3. GPUBuffer (多个)           ─── UBO / SSBO，具体数量和类型由 VulkanApp 决定
+ 4. GPUImage (storage)         ─── compute → graphics 数据通道
+ 5. 创建 compute descriptor set layout + 分配 descriptor set + 更新
+ 6. 创建 compute pipeline layout
+ 7. ComputePipeline            ─── geodesic.comp
+ 8. 创建 graphics descriptor set layout + 分配 descriptor set
+ 9. 创建 graphics pipeline layout
+10. GraphicsPipeline           ─── presentation pass（Dynamic Rendering, 传 swapchain format）
+11. 创建 2 个 VkSemaphore
 ```
 
 ## 析构顺序
@@ -521,7 +524,7 @@ CommandBuffer ── 临时对象，每帧从 VulkanContext command pool 分配�
  3. 销毁 descriptor set layout + pipeline layout
  4. 销毁 pipeline（ComputePipeline / GraphicsPipeline 析构）
  5. 销毁 GPUImage
- 6. 销毁 GPUBuffer × 3
+ 6. 销毁 GPUBuffer（多个）
  7. 销毁 VulkanContext（command pool → image views → swapchain
                         → surface → device → instance）
 ```
@@ -543,14 +546,30 @@ RAII 保证初始化中途异常时已创建的资源被正确清理。
 | Camera（ZAMO tetrad） | Boyer-Lindquist 坐标下的轨道相机，为每像素生成初始光线四动量 |
 | Scene | 黑洞参数 (M, a)、吸积盘参数、天空背景 |
 
-### 数据流（运行时）
+### 数据流（三阶段管线）
 
 ```
-[CPU: Camera 生成每像素初始光线状态 → upload to GPUBuffer (ray storage)]
-  → [GPU Compute: geodesic.comp — 每像素并行积分测地线方程]
-  → [终止判定 + 颜色映射 (compute shader 内部)]
-  → [GPU Storage Image: vec4 颜色]
-  → [GPU Graphics: Dynamic Rendering 全屏四边形采样 → swapchain present]
+阶段一 [CPU]
+  GLFW 输入 → Camera 更新 → 写入 SpacetimeUBO (M, a) + CameraUBO (tetrad, 轨道参数)
+  → GPUBuffer 上传到 GPU 侧
+
+阶段二 [GPU Compute Pass]
+  Barrier: Storage Image → GENERAL
+  → bind ComputePipeline (geodesic.comp) + descriptor sets
+  → dispatch (每像素一个 work item):
+      CameraUBO 生成初始光线 x^μ, p^μ (BL 坐标)
+      → RK4 积分循环 (查 SpacetimeUBO 实时计算 Christoffel)
+      → 坐标转换 BL ↔ 局部欧几里得 (相交检测)
+      → 终止判定 (r ≤ r_horizon 捕获 / 逃逸 / 盘面命中)
+      → imageStore 写 Storage Image
+
+阶段三 [GPU Graphics Pass]
+  Barrier: Storage Image GENERAL → SHADER_READ_ONLY_OPTIMAL
+  → vkCmdBeginRendering 绑定 swapchain image view 为 color attachment
+  → bind GraphicsPipeline + descriptor sets
+  → fragment shader 读取 Storage Image → 输出到 swapchain
+      (当前直通，后续可在此阶段加多普勒频移等后处理)
+  → vkCmdEndRendering → submit → present
 ```
 
 ---
