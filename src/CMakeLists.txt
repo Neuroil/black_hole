@@ -1,6 +1,6 @@
 # 着色器编译
-set(SHADER_SRC_DIR "${CMAKE_SOURCE_DIR}/src/shaders")
-set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
+set(SHADER_SRC_DIR "${CMAKE_SOURCE_DIR}/shaders")
+set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/src/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
 
 function(compile_shader SHADER_FILE)
@@ -12,16 +12,14 @@ function(compile_shader SHADER_FILE)
     )
 endfunction()
 
-compile_shader(shader_base.vert)
-compile_shader(shader_base.frag)
-compile_shader(shader_ubo.vert)
-compile_shader(shader_ubo.frag)
+compile_shader(geodesic.comp)
+compile_shader(fullscreen.vert)
+compile_shader(fullscreen.frag)
 
 set(SHADER_SPV
-    "${SHADER_OUT_DIR}/shader_base.vert.spv"
-    "${SHADER_OUT_DIR}/shader_base.frag.spv"
-    "${SHADER_OUT_DIR}/shader_ubo.vert.spv"
-    "${SHADER_OUT_DIR}/shader_ubo.frag.spv"
+    "${SHADER_OUT_DIR}/geodesic.comp.spv"
+    "${SHADER_OUT_DIR}/fullscreen.vert.spv"
+    "${SHADER_OUT_DIR}/fullscreen.frag.spv"
 )
 
 add_executable(simulation main.cpp
@@ -31,7 +29,8 @@ add_executable(simulation main.cpp
         vulkan/gpu_buffer.cpp
         vulkan/gpu_image.cpp
         vulkan/compute_pipeline.cpp
-        vulkan/graphics_pipeline.cpp)
+        vulkan/graphics_pipeline.cpp
+        vulkan/command_buffer.cpp)
 
 add_dependencies(simulation shaders_spv)
 

@@ -8,7 +8,7 @@
 #include <optional>
 #include <vulkan/vulkan.h>
 
-struct queue_family_indices {
+struct QueueFamilyIndices {
     std::optional<uint32_t> graphic_family_;
     std::optional<uint32_t> compute_family_;
     std::optional<uint32_t> present_family_;

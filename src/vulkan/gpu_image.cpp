@@ -163,47 +163,28 @@ VkExtent2D GPUImage::extent() const { return extent_; }
 
 VkImageLayout GPUImage::current_layout() const { return current_layout_; }
 
-// barrier
-
-VkImageMemoryBarrier GPUImage::create_barrier(VkImageLayout new_layout,
-                                              VkAccessFlags src_access,
-                                              VkAccessFlags dst_access) const {
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = current_layout_;
-    barrier.newLayout = new_layout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image_;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-    barrier.srcAccessMask = src_access;
-    barrier.dstAccessMask = dst_access;
-    return barrier;
+void GPUImage::set_layout(VkImageLayout new_layout) {
+    current_layout_ = new_layout;
 }
 
-VkImageMemoryBarrier GPUImage::transition_barrier(VkImageLayout new_layout,
-                                                  VkAccessFlags src_access,
-                                                  VkAccessFlags dst_access) {
-    VkImageLayout old_layout = current_layout_;
-    current_layout_ = new_layout;
+// barrier
 
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = old_layout;
-    barrier.newLayout = new_layout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image_;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
+VkImageMemoryBarrier2 GPUImage::create_barrier(VkImageLayout new_layout,
+                                                VkPipelineStageFlags2 src_stage,
+                                                VkPipelineStageFlags2 dst_stage,
+                                                VkAccessFlags2 src_access,
+                                                VkAccessFlags2 dst_access) const {
+    VkImageMemoryBarrier2 barrier{};
+    barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.srcStageMask  = src_stage;
+    barrier.dstStageMask  = dst_stage;
     barrier.srcAccessMask = src_access;
     barrier.dstAccessMask = dst_access;
+    barrier.oldLayout     = current_layout_;
+    barrier.newLayout     = new_layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image               = image_;
+    barrier.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     return barrier;
 }

@@ -139,7 +139,7 @@ void VulkanContext::setup_debug_messenger() {
 }
 
 bool VulkanContext::is_physical_device_ok(VkPhysicalDevice physical_device) {
-    queue_family_indices indices = find_queue_families(physical_device);
+    QueueFamilyIndices indices = find_queue_families(physical_device);
 
     bool extension_support = check_device_extension_support(physical_device);
     bool swap_chain_adequate = false;
@@ -188,11 +188,11 @@ void VulkanContext::pickup_physical_device() {
     if (physical_device_ == VK_NULL_HANDLE) throw std::runtime_error("there's no suitable GPU!");
 }
 
-queue_family_indices VulkanContext::find_queue_families(VkPhysicalDevice physical_device) {
+QueueFamilyIndices VulkanContext::find_queue_families(VkPhysicalDevice physical_device) {
 #ifndef NDEBUG
     std::cout << "...finding the queue families..." << std::endl;
 #endif
-    queue_family_indices indices;
+    QueueFamilyIndices indices;
 
     uint32_t queue_family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nullptr);
@@ -256,7 +256,7 @@ void VulkanContext::create_logical_device() {
     std::cout << "Done.\nNow creating the logical device..." << std::endl;
 #endif
 
-    queue_family_indices indices = find_queue_families(physical_device_);
+    QueueFamilyIndices indices = find_queue_families(physical_device_);
 
     // 去重
     std::set<uint32_t> unique_families = {
@@ -336,9 +336,9 @@ choose_swap_surface_format(const std::vector<VkSurfaceFormatKHR>& available_form
 
 VkPresentModeKHR VulkanContext::
 choose_swap_present_mode(const std::vector<VkPresentModeKHR>& available_present_modes) {
-    for (const auto& availablePresentMode : available_present_modes) {
-        if (availablePresentMode == VK_PRESENT_MODE_MAILBOX_KHR) {
-            return availablePresentMode;
+    for (const auto& available_present_mode : available_present_modes) {
+        if (available_present_mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+            return available_present_mode;
         }
     }
 
@@ -367,7 +367,7 @@ VkExtent2D VulkanContext::choose_swap_extent(const VkSurfaceCapabilitiesKHR& cap
     }
 }
 
-void VulkanContext::create_swap_chain() {
+void VulkanContext::create_swap_chain(VkSwapchainKHR old_swapchain) {
 #ifndef NDEBUG
     std::cout << "Done.\nNow creating swap chain..." << std::endl;
 #endif
@@ -377,11 +377,14 @@ void VulkanContext::create_swap_chain() {
     VkPresentModeKHR present_mode = choose_swap_present_mode(swap_chain_support_details.present_modes_);
     VkExtent2D extent = choose_swap_extent(swap_chain_support_details.capabilities_);
 
-    uint32_t image_count = swap_chain_support_details.capabilities_.minImageCount + 1;
+    uint32_t image_count = std::max(
+        swap_chain_support_details.capabilities_.minImageCount,
+        3u  // 三重缓冲
+    );
 
-    if (swap_chain_support_details.capabilities_.maxImageCount > 0 && image_count > swap_chain_support_details.
-        capabilities_.maxImageCount) {
-        image_count = swap_chain_support_details.capabilities_.maxImageCount;
+    if (swap_chain_support_details.capabilities_.maxImageCount > 0) {
+        image_count = std::min(image_count,
+                               swap_chain_support_details.capabilities_.maxImageCount);
     }
 
     VkSwapchainCreateInfoKHR create_info{
@@ -395,13 +398,13 @@ void VulkanContext::create_swap_chain() {
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
     };
 
-    queue_family_indices indices = find_queue_families(physical_device_);
-    uint32_t queueFamilyIndices[] = {indices.graphic_family_.value(), indices.present_family_.value()};
+    QueueFamilyIndices indices = find_queue_families(physical_device_);
+    uint32_t queue_family_indices[] = {indices.graphic_family_.value(), indices.present_family_.value()};
 
     if (indices.graphic_family_ != indices.present_family_) {
         create_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
         create_info.queueFamilyIndexCount = 2;
-        create_info.pQueueFamilyIndices = queueFamilyIndices;
+        create_info.pQueueFamilyIndices = queue_family_indices;
     }
     else {
         create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -412,7 +415,7 @@ void VulkanContext::create_swap_chain() {
     create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     create_info.presentMode = present_mode;
     create_info.clipped = VK_TRUE;
-    create_info.oldSwapchain = VK_NULL_HANDLE;
+    create_info.oldSwapchain = old_swapchain;
 
     if (vkCreateSwapchainKHR(device_, &create_info, nullptr, &swap_chain_) != VK_SUCCESS) {
         throw std::runtime_error("failed to create swap chain!");
@@ -453,8 +456,10 @@ void VulkanContext::create_image_views() {
 }
 
 void VulkanContext::cache_queue_family_index() {
-    queue_family_indices indices = find_queue_families(physical_device_);
+    QueueFamilyIndices indices = find_queue_families(physical_device_);
     graphics_queue_family_index_ = indices.graphic_family_.value();
+    compute_queue_family_index_  = indices.compute_family_.value();
+    present_queue_family_index_ = indices.present_family_.value();
 }
 
 void VulkanContext::cache_memory_properties() {
@@ -498,7 +503,9 @@ VkSurfaceKHR VulkanContext::surface() const { return surface_; }
 VkQueue VulkanContext::graphics_queue() const { return graphics_queue_; }
 VkQueue VulkanContext::compute_queue() const { return compute_queue_; }
 VkQueue VulkanContext::presentation_queue() const { return present_queue_; }
-uint32_t VulkanContext::queue_family_index() const { return graphics_queue_family_index_; }
+uint32_t VulkanContext::graphics_queue_family() const { return graphics_queue_family_index_; }
+uint32_t VulkanContext::compute_queue_family() const { return compute_queue_family_index_; }
+uint32_t VulkanContext::presentation_queue_family() const { return present_queue_family_index_; }
 
 // ── Swapchain 查询 ──
 
@@ -516,6 +523,8 @@ uint32_t VulkanContext::window_width() const { return WIDTH; }
 uint32_t VulkanContext::window_height() const { return HEIGHT; }
 
 const VkPhysicalDeviceMemoryProperties& VulkanContext::memory_properties() const { return memory_properties_; }
+
+GLFWwindow* VulkanContext::window() const { return window_; }
 
 // ── Command buffer 分配 ──
 
@@ -535,7 +544,7 @@ uint32_t VulkanContext::acquire_next_image(VkSemaphore signal_semaphore) {
     return image_index;
 }
 
-void VulkanContext::submit(VkCommandBuffer cmd, VkSemaphore wait, VkSemaphore signal) {
+void VulkanContext::submit(VkCommandBuffer cmd, VkSemaphore wait, VkSemaphore signal, VkFence signal_fence) {
     VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
     VkSubmitInfo submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -547,7 +556,7 @@ void VulkanContext::submit(VkCommandBuffer cmd, VkSemaphore wait, VkSemaphore si
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &signal,
     };
-    vkQueueSubmit(graphics_queue_, 1, &submit_info, VK_NULL_HANDLE);
+    vkQueueSubmit(graphics_queue_, 1, &submit_info, signal_fence);
 }
 
 void VulkanContext::present(uint32_t image_index, VkSemaphore wait_semaphore) {

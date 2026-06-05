@@ -14,7 +14,7 @@ class VulkanContext;
 //
 // 设计决策：
 // - 构造时持有 const VulkanContext* ——与 GPUBuffer 统一，不重复持有裸 VkDevice
-// - create_barrier() 纯查询、不修改状态；transition_barrier() 同步更新布局追踪
+// - create_barrier() 纯查询、不修改状态；set_layout() 显式更新布局追踪（两步模型）
 // - barrier 执行由 CommandBuffer 负责——GPUImage 不操作命令流（名词/动词分离）
 // - 不内置 VMA——先用手动 vkAllocateMemory，后续按需引入
 class GPUImage {
@@ -46,15 +46,16 @@ public:
     VkExtent2D   extent()         const;
     VkImageLayout current_layout() const;
 
-    // 纯查询：生成 barrier，不修改内部布局追踪
-    VkImageMemoryBarrier create_barrier(VkImageLayout new_layout,
-                                         VkAccessFlags src_access,
-                                         VkAccessFlags dst_access) const;
+    // 显式更新布局追踪（在对应的 pipeline_barrier2 提交后调用）
+    void set_layout(VkImageLayout new_layout);
 
-    // 生成 barrier 并更新内部布局追踪
-    VkImageMemoryBarrier transition_barrier(VkImageLayout new_layout,
-                                             VkAccessFlags src_access,
-                                             VkAccessFlags dst_access);
+    // 纯查询：生成 barrier，不修改内部布局追踪
+    VkImageMemoryBarrier2 create_barrier(VkImageLayout new_layout,
+                                         VkPipelineStageFlags2 src_stage,
+                                         VkPipelineStageFlags2 dst_stage,
+                                         VkAccessFlags2 src_access,
+                                         VkAccessFlags2 dst_access) const;
+
 };
 
 #endif //BLACK_HOLE_PRAC_GPUIMAGE_H

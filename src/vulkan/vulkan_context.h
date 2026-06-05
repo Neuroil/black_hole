@@ -56,6 +56,8 @@ class VulkanContext {
     std::vector<VkImageView> swap_chain_image_views_;
 
     uint32_t graphics_queue_family_index_ = 0;
+    uint32_t compute_queue_family_index_      = 0;
+    uint32_t present_queue_family_index_     = 0;
     VkPhysicalDeviceMemoryProperties memory_properties_{};
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
@@ -68,14 +70,14 @@ class VulkanContext {
     bool is_physical_device_ok(VkPhysicalDevice physical_device);
     bool check_device_extension_support(VkPhysicalDevice physical_device);
     void pickup_physical_device();
-    queue_family_indices find_queue_families(VkPhysicalDevice device);
+    QueueFamilyIndices find_queue_families(VkPhysicalDevice device);
     void create_surface();
     void create_logical_device();
     swap_chain_support_details query_swap_chain_support(VkPhysicalDevice device);
     VkSurfaceFormatKHR choose_swap_surface_format(const std::vector<VkSurfaceFormatKHR>& available_formats);
     VkPresentModeKHR choose_swap_present_mode(const std::vector<VkPresentModeKHR>& available_present_modes);
     VkExtent2D choose_swap_extent(const VkSurfaceCapabilitiesKHR& capabilities);
-    void create_swap_chain();
+    void create_swap_chain(VkSwapchainKHR old_swapchain = VK_NULL_HANDLE);
     void create_image_views();
     void cache_queue_family_index();
     void cache_memory_properties();
@@ -118,7 +120,9 @@ public:
     VkQueue graphics_queue() const;
     VkQueue compute_queue() const;
     VkQueue presentation_queue() const;
-    uint32_t queue_family_index() const;
+    uint32_t graphics_queue_family()     const;
+    uint32_t compute_queue_family()      const;
+    uint32_t presentation_queue_family() const;
 
     // Swapchain
     VkSwapchainKHR swapchain() const;
@@ -143,11 +147,11 @@ public:
 
     // Swapchain 帧循环
     uint32_t acquire_next_image(VkSemaphore signal_semaphore);
-    void submit(VkCommandBuffer cmd, VkSemaphore wait, VkSemaphore signal);
+    void submit(VkCommandBuffer cmd, VkSemaphore wait, VkSemaphore signal, VkFence signal_fence);
     void present(uint32_t image_index, VkSemaphore wait_semaphore);
 
     // window
-    GLFWwindow* get_p_windows() const { return window_; }
+    GLFWwindow* window() const;
 };
 
 #endif // BLACK_HOLE_PRAC_VULKANCONTEXT_H
