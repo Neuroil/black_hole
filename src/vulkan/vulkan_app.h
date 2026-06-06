@@ -15,8 +15,6 @@
 #include <memory>
 #include <vector>
 
-static constexpr int MAX_FRAMES_IN_FLIGHT = 3;
-
 class VulkanApp {
     std::unique_ptr<VulkanContext> context_;
     GLFWwindow* window_ = nullptr;

@@ -8,12 +8,11 @@
 #include <cstring>
 
 VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr) {
-
-    // ── 1. 硬件初始化 ──
+    // 硬件初始化
     context_ = std::make_unique<VulkanContext>(w, h);
-    window_  = context_->window();
+    window_ = context_->window();
 
-    // ── 2. GPU Buffer ──
+    // GPU Buffer
     camera_ubo_ = std::make_unique<GPUBuffer>(
         context_.get(), 64,
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -26,15 +25,15 @@ VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr) {
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    // ── 3. Storage Image ──
+    // Storage Image
     storage_image_ = std::make_unique<GPUImage>(
         context_.get(), w, h,
         VK_FORMAT_R32G32B32A32_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
-    // ── 4. Sampler（graphics pass 采样 storage image 用）──
+    // Sampler（graphics pass 采样 storage image 用）
     VkSamplerCreateInfo sampler_info{};
-    sampler_info.sType     = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     sampler_info.magFilter = VK_FILTER_NEAREST;
     sampler_info.minFilter = VK_FILTER_NEAREST;
     sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -45,48 +44,48 @@ VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr) {
         throw std::runtime_error("failed to create storage sampler!");
     }
 
-    // ── 5. Descriptor Set Layout ──
+    // Descriptor Set Layout
 
-    // Compute：binding 0=CameraUBO, 1=SpacetimeUBO, 2=storage image
+    // Compute：binding 0=CameraUBO, 1=SpacetimeUBO, 2=StorageImage
     {
         VkDescriptorSetLayoutBinding bindings[3]{};
-        bindings[0].binding         = 0;
-        bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; // CameraUBO
         bindings[0].descriptorCount = 1;
-        bindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-        bindings[1].binding         = 1;
-        bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; // SpacetimeUBO
         bindings[1].descriptorCount = 1;
-        bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-        bindings[2].binding         = 2;
-        bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; // outImage
         bindings[2].descriptorCount = 1;
-        bindings[2].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
         create_descriptor_set_layout(
-            &compute_descriptor_set_layout_, bindings, 3);
+            &compute_descriptor_set_layout_, bindings, 3); // ← 改为 3
     }
 
-    // Graphics：binding 0=storage image（fragment shader 采样）
+    // Graphics：binding 0=CombinedImageSampler（fragment shader 采样）
     {
         VkDescriptorSetLayoutBinding binding{};
-        binding.binding         = 0;
-        binding.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.binding = 0;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         binding.descriptorCount = 1;
-        binding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
         create_descriptor_set_layout(
             &graphics_descriptor_set_layout_, &binding, 1);
     }
-
-    // ── 6. Pipeline Layout ──
+    // Pipeline Layout
     {
         VkPipelineLayoutCreateInfo layout_info{};
-        layout_info.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         layout_info.setLayoutCount = 1;
-        layout_info.pSetLayouts    = &compute_descriptor_set_layout_;
+        layout_info.pSetLayouts = &compute_descriptor_set_layout_;
         if (vkCreatePipelineLayout(context_->device(), &layout_info, nullptr,
                                    &compute_pipeline_layout_) != VK_SUCCESS) {
             throw std::runtime_error("failed to create compute pipeline layout!");
@@ -94,16 +93,16 @@ VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr) {
     }
     {
         VkPipelineLayoutCreateInfo layout_info{};
-        layout_info.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         layout_info.setLayoutCount = 1;
-        layout_info.pSetLayouts    = &graphics_descriptor_set_layout_;
+        layout_info.pSetLayouts = &graphics_descriptor_set_layout_;
         if (vkCreatePipelineLayout(context_->device(), &layout_info, nullptr,
                                    &graphics_pipeline_layout_) != VK_SUCCESS) {
             throw std::runtime_error("failed to create graphics pipeline layout!");
         }
     }
 
-    // ── 7. Pipeline ──
+    // Pipeline
     compute_pipeline_ = std::make_unique<ComputePipeline>(
         context_.get(),
         "shaders/geodesic.comp.spv",
@@ -111,32 +110,32 @@ VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr) {
 
     {
         GraphicsPipelineConfig config{};
-        config.vertex_shader_path        = "shaders/fullscreen.vert.spv";
-        config.fragment_shader_path      = "shaders/fullscreen.frag.spv";
-        config.color_attachment_formats  = { context_->swapchain_format() };
-        config.pipeline_layout           = graphics_pipeline_layout_;
-        config.pipeline_cache            = context_->pipeline_cache();
-        config.viewport_extent           = context_->swapchain_extent();
+        config.vertex_shader_path = "shaders/fullscreen.vert.spv";
+        config.fragment_shader_path = "shaders/fullscreen.frag.spv";
+        config.color_attachment_formats = {context_->swapchain_format()};
+        config.pipeline_layout = graphics_pipeline_layout_;
+        config.pipeline_cache = context_->pipeline_cache();
+        config.viewport_extent = context_->swapchain_extent();
         // fullscreen triangle：无顶点输入，vertex_bindings / vertex_attributes 留空
         graphics_pipeline_ = std::make_unique<GraphicsPipeline>(
             context_.get(), config);
     }
 
-    // ── 8. Descriptor Pool ──
+    // Descriptor Pool
     {
         VkDescriptorPoolSize pool_sizes[3]{};
-        pool_sizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        pool_sizes[0].descriptorCount = 2;  // camera + spacetime
-        pool_sizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        pool_sizes[1].descriptorCount = 1;  // compute 写
-        pool_sizes[2].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        pool_sizes[2].descriptorCount = 1;  // graphics 读
+        pool_sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        pool_sizes[0].descriptorCount = 2; // camera + spacetime
+        pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        pool_sizes[1].descriptorCount = 1; // compute 写
+        pool_sizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        pool_sizes[2].descriptorCount = 1; // graphics 读
 
         VkDescriptorPoolCreateInfo pool_info{};
-        pool_info.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.poolSizeCount = 3;
-        pool_info.pPoolSizes    = pool_sizes;
-        pool_info.maxSets       = 2;  // compute set + graphics set
+        pool_info.pPoolSizes = pool_sizes;
+        pool_info.maxSets = 2; // compute set + graphics set
 
         if (vkCreateDescriptorPool(context_->device(), &pool_info, nullptr,
                                    &descriptor_pool_) != VK_SUCCESS) {
@@ -144,10 +143,10 @@ VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr) {
         }
     }
 
-    // ── 9. Descriptor Set ──
+    // 描述集
     create_descriptor_sets();
 
-    // ── 10. 同步原语 ──
+    // 同步原语
     create_sync_objects();
 }
 
@@ -182,8 +181,8 @@ void VulkanApp::create_sync_objects() {
 }
 
 void VulkanApp::create_descriptor_set_layout(VkDescriptorSetLayout* layout,
-                                              const VkDescriptorSetLayoutBinding* bindings,
-                                              uint32_t binding_count) {
+                                             const VkDescriptorSetLayoutBinding* bindings,
+                                             uint32_t binding_count) {
     VkDescriptorSetLayoutCreateInfo layout_create_info{};
     layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout_create_info.bindingCount = binding_count;
@@ -213,39 +212,39 @@ void VulkanApp::create_descriptor_sets() {
         VkDescriptorBufferInfo camera_info{};
         camera_info.buffer = camera_ubo_->buffer();
         camera_info.offset = 0;
-        camera_info.range  = camera_ubo_->size();
+        camera_info.range = camera_ubo_->size();
 
         VkDescriptorBufferInfo spacetime_info{};
         spacetime_info.buffer = spacetime_ubo_->buffer();
         spacetime_info.offset = 0;
-        spacetime_info.range  = spacetime_ubo_->size();
+        spacetime_info.range = spacetime_ubo_->size();
 
         VkDescriptorImageInfo storage_info{};
         storage_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        storage_info.imageView   = storage_image_->image_view();
-        storage_info.sampler     = VK_NULL_HANDLE;
+        storage_info.imageView = storage_image_->image_view();
+        storage_info.sampler = VK_NULL_HANDLE;
 
         VkWriteDescriptorSet writes[3]{};
-        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet          = compute_descriptor_set_;
-        writes[0].dstBinding      = 0;
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = compute_descriptor_set_;
+        writes[0].dstBinding = 0;
         writes[0].descriptorCount = 1;
-        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[0].pBufferInfo     = &camera_info;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo = &camera_info;
 
-        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet          = compute_descriptor_set_;
-        writes[1].dstBinding      = 1;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = compute_descriptor_set_;
+        writes[1].dstBinding = 1;
         writes[1].descriptorCount = 1;
-        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[1].pBufferInfo     = &spacetime_info;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[1].pBufferInfo = &spacetime_info;
 
-        writes[2].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2].dstSet          = compute_descriptor_set_;
-        writes[2].dstBinding      = 2;
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = compute_descriptor_set_;
+        writes[2].dstBinding = 2;
         writes[2].descriptorCount = 1;
-        writes[2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[2].pImageInfo      = &storage_info;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[2].pImageInfo = &storage_info;
 
         vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
     }
@@ -264,16 +263,16 @@ void VulkanApp::create_descriptor_sets() {
 
         VkDescriptorImageInfo storage_info{};
         storage_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        storage_info.imageView   = storage_image_->image_view();
-        storage_info.sampler     = storage_sampler_;
+        storage_info.imageView = storage_image_->image_view();
+        storage_info.sampler = storage_sampler_;
 
         VkWriteDescriptorSet write{};
-        write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet          = graphics_descriptor_set_;
-        write.dstBinding      = 0;
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = graphics_descriptor_set_;
+        write.dstBinding = 0;
         write.descriptorCount = 1;
-        write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        write.pImageInfo      = &storage_info;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &storage_info;
 
         vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
     }
@@ -325,14 +324,13 @@ void VulkanApp::clean_up() {
 
 void VulkanApp::step_frame() {
     VkDevice device = context_->device();
-    VkFence   fence  = frame_fences_[current_frame_];
+    VkFence fence = frame_fences_[current_frame_];
 
     // 等待 GPU 完成上一帧
     vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &fence);
 
     // CPU 开始准备资源
-    context_->reset_command_pool();
+    context_->reset_command_pool(current_frame_);
     update_ubos();
     storage_image_->set_layout(VK_IMAGE_LAYOUT_UNDEFINED);
 
@@ -346,8 +344,11 @@ void VulkanApp::step_frame() {
     }
     images_in_flight_[image_index] = fence;
 
+    // 此时 images_in_flight_ 已更新，安全 reset fence
+    vkResetFences(device, 1, &fence);
+
     // 录制命令
-    CommandBuffer cmd(context_->allocate_command_buffer());
+    CommandBuffer cmd(context_->allocate_command_buffer(current_frame_));
     cmd.begin();
 
     // GPU Compute Pass
@@ -372,7 +373,7 @@ void VulkanApp::step_frame() {
     cmd.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE,
                              compute_pipeline_layout_, 0,
                              {compute_descriptor_set_});
-    cmd.dispatch((context_->window_width()  + 15) / 16,
+    cmd.dispatch((context_->window_width() + 15) / 16,
                  (context_->window_height() + 15) / 16, 1);
 
     // Barrier: COMPUTE → GRAPHICS
@@ -395,14 +396,14 @@ void VulkanApp::step_frame() {
     // Swapchain image: UNDEFINED → COLOR_ATTACHMENT_OPTIMAL
     {
         VkImageMemoryBarrier2 b{};
-        b.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        b.srcStageMask  = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-        b.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        b.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         b.srcAccessMask = VK_ACCESS_2_NONE;
         b.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-        b.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
-        b.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        b.image         = context_->swapchain_image(image_index);
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        b.image = context_->swapchain_image(image_index);
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkDependencyInfo dep{};
         dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -413,40 +414,55 @@ void VulkanApp::step_frame() {
 
     // GPU Graphics Pass
     VkRenderingAttachmentInfo color_attachment{};
-    color_attachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    color_attachment.imageView   = context_->swapchain_view(image_index);
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment.imageView = context_->swapchain_view(image_index);
     color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color_attachment.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color_attachment.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-    color_attachment.clearValue  = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color_attachment.clearValue = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
 
     VkRenderingInfo rendering_info{};
-    rendering_info.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering_info.renderArea           = {{0, 0}, context_->swapchain_extent()};
-    rendering_info.layerCount           = 1;
+    rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering_info.renderArea = {{0, 0}, context_->swapchain_extent()};
+    rendering_info.layerCount = 1;
     rendering_info.colorAttachmentCount = 1;
-    rendering_info.pColorAttachments    = &color_attachment;
+    rendering_info.pColorAttachments = &color_attachment;
 
     cmd.begin_rendering(rendering_info);
     cmd.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
                       graphics_pipeline_->pipeline());
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(context_->window_width());
+    viewport.height = static_cast<float>(context_->window_height());
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd.handle(), 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = context_->swapchain_extent();
+    vkCmdSetScissor(cmd.handle(), 0, 1, &scissor);
+
     cmd.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                              graphics_pipeline_layout_, 0,
                              {graphics_descriptor_set_});
-    cmd.draw(3);  // fullscreen triangle
+    cmd.draw(3); // fullscreen triangle
     cmd.end_rendering();
 
     // Swapchain image: COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR
     {
         VkImageMemoryBarrier2 b{};
-        b.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        b.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-        b.dstStageMask  = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
         b.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_2_NONE;
-        b.oldLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        b.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        b.image         = context_->swapchain_image(image_index);
+        b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        b.image = context_->swapchain_image(image_index);
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkDependencyInfo dep{};
         dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;

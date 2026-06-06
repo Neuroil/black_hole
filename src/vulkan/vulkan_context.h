@@ -15,6 +15,8 @@
 #include "queue_family_indices.h"
 #include "swap_chain_support_details.h"
 
+static constexpr int MAX_FRAMES_IN_FLIGHT = 3;
+
 const std::vector<const char*> validation_layers = {"VK_LAYER_KHRONOS_validation"};
 
 const std::vector<const char*> device_extensions = {
@@ -59,7 +61,7 @@ class VulkanContext {
     uint32_t compute_queue_family_index_      = 0;
     uint32_t present_queue_family_index_     = 0;
     VkPhysicalDeviceMemoryProperties memory_properties_{};
-    VkCommandPool command_pool_ = VK_NULL_HANDLE;
+    VkCommandPool command_pools_[MAX_FRAMES_IN_FLIGHT];
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
 
@@ -81,7 +83,7 @@ class VulkanContext {
     void create_image_views();
     void cache_queue_family_index();
     void cache_memory_properties();
-    void init_command_pool();
+    void init_command_pools();
     void init_descriptor_pool();
     void init_pipeline_cache();
 
@@ -142,8 +144,8 @@ public:
 
     // Command buffer 分配
     // 从内部 pool 分配，pool reset 统一回收
-    VkCommandBuffer allocate_command_buffer();
-    void reset_command_pool();
+    VkCommandBuffer allocate_command_buffer(uint32_t frame_index);
+    void reset_command_pool(uint32_t frame_index);
 
     // Swapchain 帧循环
     uint32_t acquire_next_image(VkSemaphore signal_semaphore);

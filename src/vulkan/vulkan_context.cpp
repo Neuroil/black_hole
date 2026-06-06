@@ -104,7 +104,8 @@ void VulkanContext::create_vulkan_instance() {
     VkInstanceCreateInfo create_info{
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &app_info,
-        .enabledLayerCount = 0,
+        .enabledLayerCount = enable_validation_layers ? static_cast<uint32_t>(validation_layers.size()) : 0,
+        .ppEnabledLayerNames = enable_validation_layers ? validation_layers.data() : nullptr,
         .enabledExtensionCount = static_cast<uint32_t>(extensions.size()),
         .ppEnabledExtensionNames = extensions.data(),
     };
@@ -279,6 +280,7 @@ void VulkanContext::create_logical_device() {
     // Dynamic Rendering
     VkPhysicalDeviceVulkan13Features features_13{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .synchronization2 = VK_TRUE,
         .dynamicRendering = VK_TRUE,
     };
 
@@ -466,10 +468,12 @@ void VulkanContext::cache_memory_properties() {
     vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties_);
 }
 
-void VulkanContext::init_command_pool() {
-    command_pool_ = vulkan_util::create_command_pool(
-        device_, graphics_queue_family_index_,
-        VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+void VulkanContext::init_command_pools() {
+    for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        command_pools_[i] = vulkan_util::create_command_pool(
+            device_, graphics_queue_family_index_,
+            VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+    }
 }
 
 void VulkanContext::init_descriptor_pool() {
@@ -528,12 +532,12 @@ GLFWwindow* VulkanContext::window() const { return window_; }
 
 // ── Command buffer 分配 ──
 
-VkCommandBuffer VulkanContext::allocate_command_buffer() {
-    return vulkan_util::allocate_command_buffer(device_, command_pool_);
+VkCommandBuffer VulkanContext::allocate_command_buffer(uint32_t frame_index) {
+    return vulkan_util::allocate_command_buffer(device_, command_pools_[frame_index]);
 }
 
-void VulkanContext::reset_command_pool() {
-    vkResetCommandPool(device_, command_pool_, 0);
+void VulkanContext::reset_command_pool(uint32_t frame_index) {
+    vkResetCommandPool(device_, command_pools_[frame_index], 0);
 }
 
 // ── Swapchain frame loop (阶段五实现) ──
@@ -544,19 +548,33 @@ uint32_t VulkanContext::acquire_next_image(VkSemaphore signal_semaphore) {
     return image_index;
 }
 
-void VulkanContext::submit(VkCommandBuffer cmd, VkSemaphore wait, VkSemaphore signal, VkFence signal_fence) {
-    VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-    VkSubmitInfo submit_info{
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &wait,
-        .pWaitDstStageMask = wait_stages,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &cmd,
-        .signalSemaphoreCount = 1,
-        .pSignalSemaphores = &signal,
+void VulkanContext::submit(VkCommandBuffer cmd,
+                           VkSemaphore wait, VkSemaphore signal,
+                           VkFence signal_fence) {
+    VkSemaphoreSubmitInfo wait_info{
+        .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore = wait,
+        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
     };
-    vkQueueSubmit(graphics_queue_, 1, &submit_info, signal_fence);
+    VkSemaphoreSubmitInfo signal_info{
+        .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .semaphore = signal,
+        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+    };
+    VkCommandBufferSubmitInfo cmd_info{
+        .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .commandBuffer = cmd,
+    };
+    VkSubmitInfo2 submit_info2{
+        .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .waitSemaphoreInfoCount   = 1,
+        .pWaitSemaphoreInfos      = &wait_info,
+        .commandBufferInfoCount   = 1,
+        .pCommandBufferInfos      = &cmd_info,
+        .signalSemaphoreInfoCount = 1,
+        .pSignalSemaphoreInfos    = &signal_info,
+    };
+    vkQueueSubmit2(graphics_queue_, 1, &submit_info2, signal_fence);
 }
 
 void VulkanContext::present(uint32_t image_index, VkSemaphore wait_semaphore) {
@@ -585,7 +603,7 @@ VulkanContext::VulkanContext(uint32_t w, uint32_t h) : WIDTH(w), HEIGHT(h) {
     create_image_views();
     cache_queue_family_index();
     cache_memory_properties();
-    init_command_pool();
+    init_command_pools();
     init_descriptor_pool();
     init_pipeline_cache();
 }
@@ -600,7 +618,9 @@ VulkanContext::~VulkanContext() {
     if (device_ != VK_NULL_HANDLE) {
         if (pipeline_cache_ != VK_NULL_HANDLE) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
         if (descriptor_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
-        if (command_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, command_pool_, nullptr);
+        for (int i = 2; i >= 0; --i) {
+            if (command_pools_[i] != VK_NULL_HANDLE) vkDestroyCommandPool(device_, command_pools_[i], nullptr);
+        }
     }
 
     // 析构 swap_chain_image_views
