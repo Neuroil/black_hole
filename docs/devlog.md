@@ -931,3 +931,104 @@ VK_KHR_ray_tracing_pipeline / VK_KHR_ray_query 假设光线直线传播，弯曲
 
 - `docs/architecture.md` — 概述/数据流/GPUBuffer/GPUImage/GraphicsPipeline/VulkanApp/step_frame/所有权/初始化顺序 全面修正
 - `CLAUDE.md` — 架构摘要同步，新增 Development workflow 强制约束段
+
+---
+
+## 2026-06-05 — Stage 4 实现：CommandBuffer
+
+### 背景
+
+按照架构设计的名词/动词分离原则，CommandBuffer 是纯 Vulkan 命令薄封装——方法签名只含 Vk* 原生类型，零业务耦合。
+
+### 完成内容
+
+实现了 `CommandBuffer` 类（`command_buffer.h/.cpp`），全部 11 个方法：
+
+| 分类 | 方法 | 说明 |
+|------|------|------|
+| 生命周期 | `begin(flags)` / `end()` | 命令缓冲录制起止，默认 ONE_TIME_SUBMIT |
+| 管线绑定 | `bind_pipeline(bind_point, pipeline)` | 绑定 compute 或 graphics pipeline |
+| 管线绑定 | `bind_descriptor_sets(bind_point, layout, first_set, sets)` | 绑定 descriptor sets |
+| 管线绑定 | `bind_vertex_buffer(buffer, offset)` | 绑定顶点缓冲 |
+| Compute | `dispatch(gx, gy, gz)` | 调度 compute shader work groups |
+| Dynamic Rendering | `begin_rendering(rendering_info)` / `end_rendering()` | 替代旧 RenderPass Begin/End |
+| Graphics | `draw(vertex_count, ...)` | 绘制调用 |
+| Graphics | `set_viewport(viewport)` / `set_scissor(scissor)` | 动态 viewport/scissor |
+| 同步 | `pipeline_barrier2(dependency_info)` | Vulkan 1.3 synchronization2 屏障 |
+
+### 设计决策
+
+- **完全通用**：方法签名只含 Vulkan 原生类型（`VkBuffer` 而非 `GPUBuffer&`）——任何 Vulkan 项目直接复用
+- 析构时不释放 VkCommandBuffer（handle 由 pool reset 统一回收）——不持有 pool 引用
+- move-only：支持 move 构造和 move 赋值，禁止拷贝
+- `set_viewport` / `set_scissor` 在类中提供，但 VulkanApp::step_frame 中 viewport 使用 float extent（非 Vulkan 原生整数）时直接调用 `vkCmdSetViewport` 也更合理
+
+---
+
+## 2026-06-05 — Stage 5 实现：VulkanApp 顶层编排 + triple-buffering
+
+### 背景
+
+CommandBuffer 就绪后，所有名词层组件（VulkanContext / GPUBuffer / GPUImage / ComputePipeline / GraphicsPipeline）和动词层组件（CommandBuffer）均已到位。需要实现 VulkanApp 顶层编排——初始化链、每帧三阶段管线、帧同步。
+
+### 完成内容
+
+**VulkanApp 类**（`vulkan_app.h/.cpp`）：
+
+- **构造链**（12 步）：VulkanContext → camera_ubo_ + spacetime_ubo_ → storage_image_ → VkSampler → compute descriptor set layout → graphics descriptor set layout → compute pipeline layout → graphics pipeline layout → ComputePipeline → GraphicsPipeline → descriptor pool + descriptor sets → sync objects
+- **triple-buffered 同步模型**：`MAX_FRAMES_IN_FLIGHT = 3`——3 组 semaphore × 2 + fence + `images_in_flight_` 追踪
+- **每帧 `step_frame()`**：完整三阶段管线
+  1. 帧同步：`vkWaitForFences` + `images_in_flight_` 冲突检测 + `vkResetFences`
+  2. CPU 准备：`reset_command_pool(current_frame_)` + `update_ubos()`（当前为 memset 清零占位）
+  3. GPU Compute Pass：barrier (UNDEFINED → GENERAL) → bind compute pipeline → dispatch → barrier (GENERAL → SHADER_READ_ONLY)
+  4. GPU Graphics Pass：swapchain barrier (UNDEFINED → COLOR_ATTACHMENT) → begin_rendering → viewport/scissor → bind graphics pipeline → draw(3) → end_rendering → swapchain barrier (COLOR_ATTACHMENT → PRESENT_SRC)
+  5. Submit + Present
+- **析构链**：`vkDeviceWaitIdle` → clean_up (descriptor pool, layouts, pipeline layouts) → sampler → semaphores/fences → 成员自动析构
+
+**VulkanContext 新增/修改**：
+
+| 接口 | 说明 |
+|------|------|
+| `swapchain_image(uint32_t i)` | 暴露 swapchain 裸 VkImage（用于构造 barrier） |
+| `allocate_command_buffer(uint32_t frame_index)` | 按帧索引从对应 pool 分配 |
+| `reset_command_pool(uint32_t frame_index)` | 按帧索引 reset pool |
+| `acquire_next_image(semaphore)` | 获取下一帧 swapchain image index |
+| `submit(cmd, wait, signal, fence)` | 使用 vkQueueSubmit2 (synchronization2) |
+| `present(image_index, wait_semaphore)` | 使用 vkQueuePresentKHR + VkPresentInfoKHR |
+
+### 设计决策
+
+- **triple-buffering 而非单帧同步**：允许 GPU 连续处理最多 3 帧，CPU 不会因等待 GPU 而闲置。semaphore 保证 GPU-GPU 依赖（acquire→compute→graphics），fence 保证 CPU-GPU 同步
+- **`images_in_flight_` 追踪**：防止多帧同时写入同一 swapchain image（image count 可能 < MAX_FRAMES_IN_FLIGHT）
+- **VkSampler 独立创建**：graphics pass 需要 sampler 来采样 storage image（作为 combined image sampler），VulkanApp 直接管理其生命周期
+- **VulkanApp 自有 descriptor pool**：与 VulkanContext 内的共享 pool 分离——前者为 compute + graphics descriptor sets 服务（具体 binding），后者为通用分配预留
+- **UBO 当前为占位**：`update_ubos()` 仅 memset 清零，等 Stage 6/7 物理层实现后填入实际数据
+- **geodesic.comp 为简化占位**：当前 shader 使用牛顿引力透镜近似（`geodesicAccel` 仅含 1/r² 项），非完整 Kerr 度规 Christoffel。完整 Kerr 积分器待 Stage 7 实现
+
+### 文件变更
+
+- 新建 `command_buffer.h/.cpp`
+- 新建 `vulkan_app.h/.cpp`
+- 修改 `vulkan_context.h/.cpp`（新增 swapchain_image getter + submit/present + frame_index 参数化）
+- 修改 `shaders/fullscreen.frag`（适配 combined image sampler）
+- 修改 `shaders/geodesic.comp`（简化为占位实现）
+
+---
+
+## 2026-06-06 — 文档同步
+
+### 背景
+
+Stage 4 和 Stage 5 的实现完成后，文档未及时更新。`CLAUDE.md` 的 Current state 表格仍标记 Stage 4/5 为"待实现"，`docs/architecture.md` 的 VulkanApp 接口和每帧流程仍为旧版设计（单 fence、单 semaphore、含 Camera/Scene 成员、构造无参）。
+
+### 完成内容
+
+- **CLAUDE.md**：更新 Stage 4/5 状态为"完成"并补充完整 checkmark 清单，Stage 7 标记为"部分"（geodesic.comp 占位），修正初始化顺序（含 VkSampler、descriptor pool、triple-buffered sync objects）
+- **docs/architecture.md**：
+  - vulkan_util 新增 `create_descriptor_pool`
+  - VulkanContext 接口：`allocate_command_buffer` / `reset_command_pool` 增加 `frame_index` 参数，新增 `swapchain_image` getter，移除 `recreate_swapchain`（未实现），新增 `window()` getter
+  - VulkanApp 接口：构造函数改为 `VulkanApp(uint32_t w, uint32_t h)`，同步原语改为 triple-buffered（MAX_FRAMES_IN_FLIGHT=3），新增 `VkSampler storage_sampler_` 和 `VkDescriptorPool descriptor_pool_`，移除 `Camera` / `Scene`（未实现），新增 helper 方法列表
+  - 每帧流程：更新为实际 triple-buffered 实现（含 `images_in_flight_` 冲突检测、动态 viewport/scissor、`draw(3)` 全屏三角形）
+  - 修正所有 RAII 类构造函数签名（`const VulkanContext*` 替代 `const VulkanContext&`）
+  - 更新所有权树 + 初始化顺序 + 设计演进记录（v5）
+- **docs/devlog.md**：本文件——补充 Stage 4、Stage 5、文档同步三段的开发记录

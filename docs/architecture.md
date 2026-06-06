@@ -59,6 +59,10 @@ VkCommandPool create_command_pool(VkDevice device, uint32_t queue_family_index,
                                    VkCommandPoolCreateFlags flags);
 VkCommandBuffer allocate_command_buffer(VkDevice device, VkCommandPool pool);
 
+VkDescriptorPool create_descriptor_pool(VkDevice device, uint32_t max_sets,
+                                        const std::vector<VkDescriptorPoolSize>& pool_sizes,
+                                        VkDescriptorPoolCreateFlags flags);
+
 } // namespace vulkan_util
 ```
 
@@ -115,6 +119,7 @@ public:
 
     // ── Swapchain（Dynamic Rendering：用 swapchain_view 取代 framebuffer） ──
     VkSwapchainKHR swapchain()              const;
+    VkImage        swapchain_image(uint32_t i) const;
     VkImageView    swapchain_view(uint32_t i) const;
     uint32_t       swapchain_view_count()   const;
     VkFormat       swapchain_format()       const;
@@ -129,8 +134,8 @@ public:
     uint32_t window_height() const;
 
     // ── Command buffer 分配（每帧从内部 pool 分配，pool reset 统一回收） ──
-    VkCommandBuffer allocate_command_buffer();
-    void reset_command_pool();
+    VkCommandBuffer allocate_command_buffer(uint32_t frame_index);
+    void reset_command_pool(uint32_t frame_index);
 
     // ── Swapchain 帧循环（semaphore + fence 同步） ──
     uint32_t acquire_next_image(VkSemaphore signal_semaphore);
@@ -139,19 +144,18 @@ public:
                 VkFence signal_fence);          // fence 用于 CPU 侧帧完成等待
     void present(uint32_t image_index, VkSemaphore wait_semaphore);
 
-    // ── Swapchain 重建（窗口 resize 时调用） ──
-    // 重建 swapchain + image views；storage image、pipeline、descriptor binding 由 VulkanApp 负责
-    void recreate_swapchain(uint32_t new_w, uint32_t new_h);
+    // ── window ──
+    GLFWwindow* window() const;
 };
 ```
 
 **设计决策**：
 - **没有** VkRenderPass、VkFramebuffer：Dynamic Rendering 下帧缓冲在 `vkCmdBeginRendering` 时动态指定，swapchain image view 直接作为渲染目标
 - **三个独立的 queue family index getter**：`graphics_queue_family()`、`compute_queue_family()`、`presentation_queue_family()`——当前假设三者同 family（多数桌面 GPU），但接口语义明确，支持异构情况而无需改调用方
-- Command pool 内置：`allocate_command_buffer()` 和 `reset_command_pool()` 由 VulkanContext 管理，CommandBuffer 是每帧临时分配、pool reset 统一回收的"速记员"
+- Command pool 内置：`allocate_command_buffer(frame_index)` 和 `reset_command_pool(frame_index)` 由 VulkanContext 管理，`MAX_FRAMES_IN_FLIGHT` 个独立 pool 实现 triple-buffering。CommandBuffer 是每帧临时分配、pool reset 统一回收的"速记员"
 - `submit()` 增加 `VkFence` 参数：调用方（VulkanApp）在帧首 `vkWaitForFences` + `vkResetFences`，确保 GPU 完成后再调用 `reset_command_pool()`
 - DescriptorPool 共享：避免每个上层组件各自维护 pool
-- `recreate_swapchain()` 预留接口：Stage 8 实现；重建顺序为 `vkDeviceWaitIdle` → 销毁旧 image views / swapchain → 重建；storage image 尺寸跟进、pipeline viewport 更新、descriptor binding 刷新由 VulkanApp 负责
+- `swapchain_image()` 与 `swapchain_view()` 并列——前者用于构造 barrier（需要裸 VkImage），后者用于 Dynamic Rendering 的 color attachment
 - **不**持有 descriptor set layout 或 pipeline —— 这些是上层应用细节
 - 析构顺序（由内而外）：command pool → image views → swapchain → surface → device → instance → GLFW window
 
@@ -164,7 +168,7 @@ public:
 ```cpp
 class GPUBuffer {
 public:
-    GPUBuffer(const VulkanContext& context,
+    GPUBuffer(const VulkanContext* p_context,
               VkDeviceSize size,
               VkBufferUsageFlags usage,
               VkMemoryPropertyFlags memory_properties);
@@ -199,7 +203,7 @@ public:
 ```cpp
 class GPUImage {
 public:
-    GPUImage(const VulkanContext& context,
+    GPUImage(const VulkanContext* context,
              uint32_t width, uint32_t height,
              VkFormat format,
              VkImageUsageFlags usage,
@@ -254,7 +258,7 @@ private:
 ```cpp
 class ComputePipeline {
 public:
-    ComputePipeline(const VulkanContext& context,
+    ComputePipeline(const VulkanContext* p_context,
                     const std::string& shader_path,
                     VkPipelineLayout pipeline_layout,
                     VkPipelineCache pipeline_cache = VK_NULL_HANDLE);
@@ -311,7 +315,7 @@ struct GraphicsPipelineConfig {
 
 class GraphicsPipeline {
 public:
-    GraphicsPipeline(const VulkanContext& context,
+    GraphicsPipeline(const VulkanContext* p_context,
                      const GraphicsPipelineConfig& config);
     ~GraphicsPipeline();
 
@@ -394,7 +398,7 @@ private:
 ```cpp
 class VulkanApp {
 public:
-    explicit VulkanApp();
+    VulkanApp(uint32_t w, uint32_t h);
     ~VulkanApp();
     void run();
 
@@ -411,37 +415,64 @@ private:
     std::unique_ptr<GraphicsPipeline> graphics_pipeline_;// presentation pass → swapchain
 
     // 少数裸 handle（量太少，不值得单独包装类；VulkanApp 负责生命周期）
+    VkDescriptorPool      descriptor_pool_                = VK_NULL_HANDLE;
     VkDescriptorSetLayout compute_descriptor_set_layout_  = VK_NULL_HANDLE;
     VkDescriptorSet       compute_descriptor_set_         = VK_NULL_HANDLE;
     VkDescriptorSetLayout graphics_descriptor_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorSet       graphics_descriptor_set_        = VK_NULL_HANDLE;
     VkPipelineLayout      compute_pipeline_layout_        = VK_NULL_HANDLE;
     VkPipelineLayout      graphics_pipeline_layout_       = VK_NULL_HANDLE;
-    VkSemaphore           image_available_semaphore_      = VK_NULL_HANDLE;
-    VkSemaphore           render_finished_semaphore_      = VK_NULL_HANDLE;
-    VkFence               frame_fence_                    = VK_NULL_HANDLE; // 帧完成 fence
+    VkSampler             storage_sampler_                = VK_NULL_HANDLE;
 
-    // 物理层
-    Camera camera_;
-    Scene  scene_;
+    // 同步原语（triple-buffered：MAX_FRAMES_IN_FLIGHT = 3）
+    VkSemaphore image_available_semaphores_[MAX_FRAMES_IN_FLIGHT];
+    VkSemaphore render_finished_semaphores_[MAX_FRAMES_IN_FLIGHT];
+    VkFence     frame_fences_[MAX_FRAMES_IN_FLIGHT];
+    std::vector<VkFence> images_in_flight_;   // 跟踪每个 swapchain image 的 in-flight fence
+    uint32_t current_frame_ = 0;
+
+    // ── helpers ──
+    void create_sync_objects();
+    void create_descriptor_set_layout(VkDescriptorSetLayout* layout,
+                                       const VkDescriptorSetLayoutBinding* bindings,
+                                       uint32_t binding_count);
+    void create_descriptor_sets();
+    void update_ubos();
+    void main_loop();
+    void clean_up();
+    void step_frame();
 };
 ```
 
-**每帧流程**（即架构文档——意图直接写在代码里）：
+**每帧流程**（triple-buffered，MAX_FRAMES_IN_FLIGHT = 3）：
 
 ```cpp
 void VulkanApp::step_frame() {
-    // ═══════════ 帧同步：等待上一帧 GPU 完成 ═══════════
-    // 确保 GPU 已完成上一帧，再安全 reset command pool
-    vkWaitForFences(context_->device(), 1, &frame_fence_, VK_TRUE, UINT64_MAX);
-    vkResetFences(context_->device(), 1, &frame_fence_);
+    VkDevice device = context_->device();
+    VkFence fence = frame_fences_[current_frame_];
 
-    // ═══════════ 阶段一：CPU 端准备 ═══════════
-    context_->reset_command_pool();  // GPU 已确认完成，safe
-    // GLFW 捕获输入 → 更新 Camera 状态 → 将 CameraUBO / SpacetimeUBO 写入 GPUBuffer
+    // ═══════════ 帧同步：等待当前 slot 的上一帧 GPU 完成 ═══════════
+    vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+
+    // CPU 端准备
+    context_->reset_command_pool(current_frame_);  // GPU 已确认完成，safe
     update_ubos();
+    storage_image_->set_layout(VK_IMAGE_LAYOUT_UNDEFINED);
 
-    CommandBuffer cmd(context_->allocate_command_buffer());
+    // 请求 swapchain 图像
+    uint32_t image_index =
+        context_->acquire_next_image(image_available_semaphores_[current_frame_]);
+
+    // 等待该 swapchain image 的前一帧完成（若有）
+    if (images_in_flight_[image_index] != VK_NULL_HANDLE) {
+        vkWaitForFences(device, 1, &images_in_flight_[image_index],
+                        VK_TRUE, UINT64_MAX);
+    }
+    images_in_flight_[image_index] = fence;
+    vkResetFences(device, 1, &fence);
+
+    // 录制命令
+    CommandBuffer cmd(context_->allocate_command_buffer(current_frame_));
     cmd.begin();
 
     // ═══════════ 阶段二：GPU Compute Pass（测地线积分） ═══════════
@@ -451,7 +482,7 @@ void VulkanApp::step_frame() {
             VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_NONE,                       VK_ACCESS_2_SHADER_WRITE_BIT);
-        VkDependencyInfo dep = {};
+        VkDependencyInfo dep{};
         dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         dep.imageMemoryBarrierCount = 1;
         dep.pImageMemoryBarriers = &b;
@@ -461,20 +492,17 @@ void VulkanApp::step_frame() {
 
     cmd.bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline_->pipeline());
     cmd.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_COMPUTE,
-                              compute_pipeline_layout_, 0, { compute_descriptor_set_ });
-    // 每像素一个 work item：CameraUBO 生成初始光线 → RK4 积分（查 SpacetimeUBO 计算 Christoffel）
-    // → 终止判定（捕获/逃逸/盘面命中）→ imageStore 写 Storage Image
-    cmd.dispatch(ceil_div(context_->window_width(),  16),
-                 ceil_div(context_->window_height(), 16), 1);
+                              compute_pipeline_layout_, 0, {compute_descriptor_set_});
+    cmd.dispatch((context_->window_width() + 15) / 16,
+                 (context_->window_height() + 15) / 16, 1);
 
-    // ═══════════ 阶段三：GPU Graphics Pass（屏幕呈递） ═══════════
-    // Storage image: GENERAL → SHADER_READ_ONLY_OPTIMAL (fragment shader 读取)
+    // Barrier: COMPUTE → GRAPHICS
     {
         VkImageMemoryBarrier2 b = storage_image_->create_barrier(
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
             VK_ACCESS_2_SHADER_WRITE_BIT,              VK_ACCESS_2_SHADER_READ_BIT);
-        VkDependencyInfo dep = {};
+        VkDependencyInfo dep{};
         dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         dep.imageMemoryBarrierCount = 1;
         dep.pImageMemoryBarriers = &b;
@@ -482,11 +510,10 @@ void VulkanApp::step_frame() {
         storage_image_->set_layout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
 
-    uint32_t image_index = context_->acquire_next_image(image_available_semaphore_);
-
-    // Swapchain image: UNDEFINED/PRESENT_SRC_KHR → COLOR_ATTACHMENT_OPTIMAL
+    // ═══════════ 阶段三：GPU Graphics Pass（屏幕呈递） ═══════════
+    // Swapchain image: UNDEFINED → COLOR_ATTACHMENT_OPTIMAL
     {
-        VkImageMemoryBarrier2 b = {};
+        VkImageMemoryBarrier2 b{};
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         b.srcStageMask  = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
         b.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -494,16 +521,16 @@ void VulkanApp::step_frame() {
         b.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
         b.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
         b.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        b.image         = context_->swapchain_image(image_index); // 见注①
-        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        VkDependencyInfo dep = {};
+        b.image         = context_->swapchain_image(image_index);
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{};
         dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         dep.imageMemoryBarrierCount = 1;
         dep.pImageMemoryBarriers = &b;
         cmd.pipeline_barrier2(dep);
     }
 
-    VkRenderingAttachmentInfo color_attachment = {};
+    VkRenderingAttachmentInfo color_attachment{};
     color_attachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     color_attachment.imageView   = context_->swapchain_view(image_index);
     color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -511,7 +538,7 @@ void VulkanApp::step_frame() {
     color_attachment.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
     color_attachment.clearValue  = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
 
-    VkRenderingInfo rendering_info = {};
+    VkRenderingInfo rendering_info{};
     rendering_info.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
     rendering_info.renderArea           = {{0, 0}, context_->swapchain_extent()};
     rendering_info.layerCount           = 1;
@@ -519,18 +546,29 @@ void VulkanApp::step_frame() {
     rendering_info.pColorAttachments    = &color_attachment;
 
     cmd.begin_rendering(rendering_info);
-
-    // Fragment shader 读取 Storage Image → 输出到 swapchain（当前直通，后续可在此加后处理）
     cmd.bind_pipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_->pipeline());
-    cmd.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              graphics_pipeline_layout_, 0, { graphics_descriptor_set_ });
-    cmd.draw(vertex_count);
 
+    // Dynamic viewport & scissor
+    VkViewport viewport{};
+    viewport.x = 0.0f; viewport.y = 0.0f;
+    viewport.width  = static_cast<float>(context_->window_width());
+    viewport.height = static_cast<float>(context_->window_height());
+    viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd.handle(), 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = context_->swapchain_extent();
+    vkCmdSetScissor(cmd.handle(), 0, 1, &scissor);
+
+    cmd.bind_descriptor_sets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              graphics_pipeline_layout_, 0, {graphics_descriptor_set_});
+    cmd.draw(3);  // fullscreen triangle
     cmd.end_rendering();
 
     // Swapchain image: COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR
     {
-        VkImageMemoryBarrier2 b = {};
+        VkImageMemoryBarrier2 b{};
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         b.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         b.dstStageMask  = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
@@ -539,8 +577,8 @@ void VulkanApp::step_frame() {
         b.oldLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         b.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         b.image         = context_->swapchain_image(image_index);
-        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        VkDependencyInfo dep = {};
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{};
         dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         dep.imageMemoryBarrierCount = 1;
         dep.pImageMemoryBarriers = &b;
@@ -549,16 +587,20 @@ void VulkanApp::step_frame() {
 
     cmd.end();
 
-    // 提交与呈现（semaphore + fence 同步）
+    // 提交与呈现
     context_->submit(cmd.handle(),
-                     image_available_semaphore_,
-                     render_finished_semaphore_,
-                     frame_fence_);                // GPU 完成后 signal fence
-    context_->present(image_index, render_finished_semaphore_);
+                     image_available_semaphores_[current_frame_],
+                     render_finished_semaphores_[current_frame_],
+                     fence);
+    context_->present(image_index, render_finished_semaphores_[current_frame_]);
+
+    current_frame_ = (current_frame_ + 1) % MAX_FRAMES_IN_FLIGHT;
 }
 ```
 
-> **注①**：需在 `VulkanContext` 上新增 `VkImage swapchain_image(uint32_t i) const`，暴露 swapchain 的裸 VkImage（用于构造 barrier），与已有的 `swapchain_view()` 并列。
+> **同步模型**：triple-buffered (MAX_FRAMES_IN_FLIGHT = 3)。3 组 semaphore + fence 轮转——GPU 可连续处理最多 3 帧，CPU 在帧首等待当前 slot 的 fence 确保 GPU 完成。`images_in_flight_` 数组跟踪每个 swapchain image 的 in-flight fence，防止同时向同一 image 提交多帧。
+>
+> **注**：viewport 和 scissor 通过 `vkCmdSetViewport` / `vkCmdSetScissor` 直接在 CommandBuffer 上设置（不走 CommandBuffer 封装方法），因为它们的参数（float extent）已经超出纯 Vulkan 薄封装的范围。
 
 ---
 
@@ -569,15 +611,16 @@ VulkanApp ──owns──► VulkanContext (含 GLFWwindow)
                  ├─ GPUBuffer: camera_ubo_    (CameraUBO)
                  ├─ GPUBuffer: spacetime_ubo_ (SpacetimeUBO)
                  ├─ GPUImage  (storage image — compute → graphics 数据通道)
+                 ├─ VkSampler  (storage image 采样用)
                  ├─ ComputePipeline
                  ├─ GraphicsPipeline
+                 ├─ VkDescriptorPool (VulkanApp 自有，不同于 VulkanContext 内的共享 pool)
                  ├─ VkDescriptorSetLayout × 2 (raw)
                  ├─ VkDescriptorSet × 2 (raw)
                  ├─ VkPipelineLayout × 2 (raw)
-                 ├─ VkSemaphore × 2 (raw)
-                 ├─ VkFence × 1 (frame_fence_, raw)
-                 ├─ Camera
-                 └─ Scene
+                 ├─ VkSemaphore × 6 (image_available × 3 + render_finished × 3, raw)
+                 └─ VkFence × 3 (frame_fences_, raw)
+                 └─ std::vector<VkFence> images_in_flight_ (每 swapchain image 一个)
 
 CommandBuffer ── 临时对象，每帧从 VulkanContext command pool 分配，pool reset 时回收
 ```
@@ -585,17 +628,18 @@ CommandBuffer ── 临时对象，每帧从 VulkanContext command pool 分配�
 ## 初始化顺序
 
 ```
- 1. VulkanContext              ─── 底层硬件全部就绪（含 GLFW window、command pool、descriptor pool）
- 2. GPUBuffer: camera_ubo_    ─── CameraUBO（host-visible）
- 3. GPUBuffer: spacetime_ubo_ ─── SpacetimeUBO（host-visible）
- 4. GPUImage (storage)         ─── compute → graphics 数据通道
- 5. 创建 compute descriptor set layout + 分配 descriptor set + 更新
- 6. 创建 compute pipeline layout
- 7. ComputePipeline            ─── geodesic.comp
- 8. 创建 graphics descriptor set layout + 分配 descriptor set
- 9. 创建 graphics pipeline layout
-10. GraphicsPipeline           ─── presentation pass（Dynamic Rendering, 传 swapchain format）
-11. 创建 2 个 VkSemaphore + 1 个 VkFence（VK_FENCE_CREATE_SIGNALED_BIT，首帧直接通过）
+ 1. VulkanContext              ─── 底层硬件全部就绪（含 GLFW window、command pool × 3、descriptor pool、pipeline cache）
+ 2. GPUBuffer: camera_ubo_    ─── CameraUBO（host-visible, 64 bytes）
+ 3. GPUBuffer: spacetime_ubo_ ─── SpacetimeUBO（host-visible, 64 bytes）
+ 4. GPUImage (storage)         ─── compute → graphics 数据通道（VK_FORMAT_R32G32B32A32_SFLOAT）
+ 5. VkSampler                  ─── NEAREST, CLAMP_TO_EDGE（graphics pass 采样 storage image）
+ 6. 创建 compute descriptor set layout（binding 0=CameraUBO, 1=SpacetimeUBO, 2=StorageImage）
+ 7. 创建 graphics descriptor set layout（binding 0=CombinedImageSampler）
+ 8. 创建 compute pipeline layout + graphics pipeline layout
+ 9. ComputePipeline            ─── geodesic.comp.spv
+10. GraphicsPipeline           ─── fullscreen.vert.spv + fullscreen.frag.spv（Dynamic Rendering, 传 swapchain format）
+11. VkDescriptorPool (VulkanApp 自有) + 分配/更新 compute + graphics descriptor sets
+12. 创建 sync objects：3 组 semaphore × 2 + fence（VK_FENCE_CREATE_SIGNALED_BIT，首帧直接通过）+ images_in_flight_
 ```
 
 ## 析构顺序
@@ -767,5 +811,6 @@ blackhole_prac/
 | 2026-06-01 v2 | 名词/动词分离 + Dynamic Rendering | CommandRecord → CommandBuffer（纯动词），新增 GPUImage，砍掉 RenderPass/Framebuffer，Vulkan 1.3 Dynamic Rendering 全覆盖 |
 | 2026-06-03 v3 | 名词类 context 指针统一 + 职责边界修正 | GPUBuffer/GPUImage 统一持有 `const VulkanContext*` 替代裸 `VkDevice`，砍掉 GPUBuffer 的 `upload_from_host`（越界），VulkanContext 构造函数内置窗口创建 |
 | 2026-06-04 v4 | 同步模型补全 + 接口精确化 | 新增 frame fence（CPU/GPU 帧同步），补全 swapchain image barrier（渲染前后各一次），barrier 接口升级到 synchronization2，queue family index 拆分为三个独立 getter，GPUImage 布局更新改为显式两步（create_barrier + set_layout），VulkanContext 明确 GLFW window 所有权，UBO 改为具名成员，预留 recreate_swapchain 接口 |
+| 2026-06-05 v5 | Stage 4+5 实现 + triple-buffering | CommandBuffer 全部方法实现（begin/end, bind_pipeline, bind_descriptor_sets, dispatch, begin_rendering/end_rendering, draw, pipeline_barrier2 等）。VulkanApp 完整实现：构造链（VulkanContext → UBO → GPUImage → VkSampler → descriptor set layouts → pipeline layouts → pipelines → descriptor pool → descriptor sets → sync objects），triple-buffered 帧循环（MAX_FRAMES_IN_FLIGHT=3, images_in_flight_ 追踪），每帧三阶段管线（compute barrier → dispatch → graphics barrier → swapchain barrier → begin_rendering → draw → end_rendering → swapchain barrier → submit → present）。VulkanContext 新增 `swapchain_image()` getter，`allocate_command_buffer` / `reset_command_pool` 改为按 frame_index 操作。vulkan_util 新增 `create_descriptor_pool` |
 
-当前版本：**v4**（2026-06-04）
+当前版本：**v5**（2026-06-05）
