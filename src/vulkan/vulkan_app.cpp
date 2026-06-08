@@ -309,7 +309,7 @@ void VulkanApp::update_ubos() {
 
     // ── 场景参数 ──
     float M = 1.0f;
-    float a = 0.0f;
+    float a = 0.9f;
     float a2 = a * a;
     float horizon_r = M + std::sqrt(M * M - a2);
     float inner_r   = M - std::sqrt(M * M - a2);
