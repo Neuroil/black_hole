@@ -141,6 +141,11 @@ void VulkanContext::setup_debug_messenger() {
 
 bool VulkanContext::is_physical_device_ok(VkPhysicalDevice physical_device) {
     QueueFamilyIndices indices = find_queue_families(physical_device);
+#ifndef NDEBUG
+    VkPhysicalDeviceProperties physical_device_properties;
+    vkGetPhysicalDeviceProperties(physical_device, &physical_device_properties);
+    std::cout << "Device_name: " << physical_device_properties.deviceName << std::endl;
+#endif
 
     bool extension_support = check_device_extension_support(physical_device);
     bool swap_chain_adequate = false;

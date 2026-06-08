@@ -1,0 +1,672 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// ── UBO: 相机参数 (binding 0) ──
+layout(set = 0, binding = 0) uniform CameraUBO {
+    vec4  camPos;        // (t, r, θ, φ) in BL coords + pad
+    mat4  invViewProj;
+    float stepSize;
+    int   maxSteps;
+    float escapeRadius;
+    float pad0;
+} cam;
+
+// ── UBO: 时空参数 (binding 1) ──
+layout(set = 0, binding = 1) uniform SpacetimeUBO {
+    vec4 bhParams;       // (M, a, horizon_radius, inner_horizon_radius)
+    vec4 integratorParams;
+    vec4 diskParams;     // (inner_r, outer_r, height, pad)
+} spacetime;
+
+// ── 输出 (binding 2) ──
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D outImage;
+
+// ══════════════════════════════════════════════════════════════
+// 度规辅助
+// ══════════════════════════════════════════════════════════════
+
+float Sigma(float r, float ct, float a2) { return r * r + a2 * ct * ct; }
+float Delta(float r, float M, float a2)  { return r * r - 2.0 * M * r + a2; }
+
+// 协变度规分量（仅初始条件求 p^t 需要）
+float g_dn(int mu, int nu, vec4 pos, float M, float a, float a2) {
+    float r = pos.y, theta = pos.z;
+    float st = sin(theta), st2 = st * st;
+    float S  = Sigma(r, cos(theta), a2);
+
+    if (mu == 0 && nu == 0) return -(1.0 - 2.0 * M * r / S);
+    if ((mu == 0 && nu == 3) || (mu == 3 && nu == 0)) return -2.0 * M * a * r * st2 / S;
+    if (mu == 1 && nu == 1) return S / Delta(r, M, a2);
+    if (mu == 2 && nu == 2) return S;
+    if (mu == 3 && nu == 3) {
+        float r2 = r * r;
+        return (r2 + a2 + 2.0 * M * a2 * r * st2 / S) * st2;
+    }
+    return 0.0;
+}
+
+// ══════════════════════════════════════════════════════════════
+// 测地线方程右端 — Kerr 非零 Christoffel 展开
+// dx^μ/dλ = p^μ ;  dp^μ/dλ = -Γ^μ_αβ p^α p^β
+// ══════════════════════════════════════════════════════════════
+
+void geodesicRHS(vec4 pos, vec4 mom, float M, float a, float a2,
+                 out vec4 dPos, out vec4 dMom) {
+    dPos = mom;
+
+    float r = pos.y, theta = pos.z;
+    float st = sin(theta), ct = cos(theta);
+    float st2 = st * st, ct2 = ct * ct;
+    float S  = r * r + a2 * ct2;
+    float D  = r * r - 2.0 * M * r + a2;
+    float r2 = r * r;
+
+    float dS_dr = 2.0 * r;
+    float dS_dtheta = -2.0 * a2 * st * ct;
+    float dD_dr = 2.0 * (r - M);
+
+    float S2 = S * S, S3 = S * S2;
+    float r2pa2 = r2 + a2;
+
+    float pt = mom.x, pr = mom.y, pth = mom.z, pph = mom.w;
+
+    // Γ^t
+    float Gt = 0.0;
+    Gt += 2.0 * (((r2pa2) * (r2pa2 * dS_dr - 2.0 * r * S)) / (2.0 * S2 * D)) * pt * pr;
+    Gt += 2.0 * (-a2 * M * r * st * ct * 2.0 / S2) * pt * pth;
+    Gt += 2.0 * (-a * M * st2 * (a2 * ct2 * (S - 2.0 * r2) + r2 * S) / (S2 * D)) * pr * pph;
+    Gt += 2.0 * (-2.0 * a * M * r * r2pa2 * st * ct * st2 / (S2 * D)) * pth * pph;
+
+    // Γ^r
+    float Gr = 0.0;
+    Gr += (-M * D * (S - 2.0 * r2) / S3) * pt * pt;
+    Gr += 2.0 * (M * a * st2 * D * (S - 2.0 * r2) / S3) * pt * pph;
+    Gr += ((dS_dr * D - S * dD_dr) / (2.0 * S * D)) * pr * pr;
+    Gr += 2.0 * (-a2 * st * ct / S) * pr * pth;
+    Gr += (-r * D / S) * pth * pth;
+    Gr += (-st2 * D * (r * S2 + M * a2 * st2 * (S - 2.0 * r2)) / S3) * pph * pph;
+
+    // Γ^θ
+    float Gth = 0.0;
+    Gth += (-2.0 * a2 * M * r * st * ct / S3) * pt * pt;
+    Gth += 2.0 * (2.0 * a * M * r * r2pa2 * st * ct / S3) * pt * pph;
+    Gth += 2.0 * (r / S) * pr * pth;
+    Gth += (dS_dtheta / (2.0 * S)) * pth * pth;
+    float term_th_pp = r2pa2 * S2 + 2.0 * M * a2 * r * st2 * (S + r2pa2);
+    Gth += (-st * ct * term_th_pp / S3) * pph * pph;
+
+    // Γ^φ
+    float Gph = 0.0;
+    Gph += 2.0 * (-a * M * (S - 2.0 * r2) / (S2 * D)) * pt * pr;
+    if (abs(st) > 1e-10) {
+        Gph += 2.0 * (-2.0 * a * M * r * ct / (S2 * st)) * pt * pth;
+    }
+    Gph += 2.0 * ((S * (r * S - M * (r2 - a2 * ct2)) + r * r2pa2 * dS_dr) / (2.0 * S2 * D)) * pr * pph;
+    if (abs(st) > 1e-10) {
+        Gph += 2.0 * (ct / st + a2 * M * r * st * ct * 2.0 / S2) * pth * pph;
+    }
+
+    dMom = vec4(-Gt, -Gr, -Gth, -Gph);
+}
+
+// ── 固定步长 RK4 ──
+void rk4Step(inout vec4 pos, inout vec4 mom, float h,
+             float M, float a, float a2) {
+    vec4 k1p, k1m; geodesicRHS(pos, mom, M, a, a2, k1p, k1m);
+    vec4 k2p, k2m; geodesicRHS(pos + 0.5*h*k1p, mom + 0.5*h*k1m, M, a, a2, k2p, k2m);
+    vec4 k3p, k3m; geodesicRHS(pos + 0.5*h*k2p, mom + 0.5*h*k2m, M, a, a2, k3p, k3m);
+    vec4 k4p, k4m; geodesicRHS(pos + h*k3p,     mom + h*k3m,     M, a, a2, k4p, k4m);
+
+    pos += (h / 6.0) * (k1p + 2.0*k2p + 2.0*k3p + k4p);
+    mom += (h / 6.0) * (k1m + 2.0*k2m + 2.0*k3m + k4m);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 背景 + 坐标转换
+// ══════════════════════════════════════════════════════════════
+
+vec3 sampleBackground(vec3 dir) {
+    vec3 d = normalize(dir);
+    float galaxy = exp(-abs(d.y) * 6.0) * 0.12;
+    vec3 bg = vec3(galaxy * 0.3, galaxy * 0.4, galaxy * 0.7);
+    vec3 sd = floor(d * 250.0);
+    float hsh = fract(sin(dot(sd, vec3(127.1, 311.7, 74.3))) * 43758.5453);
+    float star = step(0.9975, hsh);
+    bg += vec3(0.7, 0.8, 1.0) * star * (0.3 + 0.7 * fract(hsh * 83.27));
+    return bg;
+}
+
+vec3 blToCartesian(vec4 pos) {
+    float r = pos.y, theta = pos.z, phi = pos.w;
+    float st = sin(theta);
+    return vec3(r * st * cos(phi), r * st * sin(phi), r * cos(theta));
+}
+
+// ══════════════════════════════════════════════════════════════
+// 主追踪循环 — 固定步长，仅靠视界 / escapeRadius 终止
+// ══════════════════════════════════════════════════════════════
+
+vec4 tracePhoton(vec4 startPos, vec4 startMom,
+                 float M, float a, float a2,
+                 float horizonR, float escapeR,
+                 float diskInner, float diskOuter, float diskH,
+                 float h, int maxSteps) {
+    vec4 pos = startPos;
+    vec4 mom = startMom;
+    vec3 cartStart = blToCartesian(startPos);
+
+    // 循环外，记录初始 θ 相对赤道面的符号
+    float prevSide = startPos.z - 1.57079632679;
+
+    for (int i = 0; i < maxSteps; i++) {
+        float r = pos.y;
+
+        // 调试：标记触及自转轴奇点的光线
+        if (sin(pos.z) < 0.03) {
+            return vec4(0.0, 1.0, 0.0, 1.0);  // 绿色
+        }
+
+        // 捕获
+        if (r < horizonR * 1.02) return vec4(0.0, 0.0, 0.0, 1.0);
+
+        // 逃逸 — 唯一的远场终止判据（去掉了出错的 20M 提前终止）
+        if (r > escapeR) {
+            vec3 dir = normalize(blToCartesian(pos) - cartStart);
+            return vec4(sampleBackground(dir), 1.0);
+        }
+
+        // 吸积盘命中
+        if (r >= diskInner && r <= diskOuter) {
+            float dTheta = abs(pos.z - 1.57079632679);
+            if (dTheta < diskH) {
+                float t = clamp((r - diskInner) / max(diskOuter - diskInner, 0.01), 0.0, 1.0);
+                vec3 inner = vec3(0.6, 0.8, 1.0);
+                vec3 outer = vec3(1.0, 0.5, 0.2);
+                float bright = 0.5 + 0.5 * (1.0 - t);
+                return vec4(bright * mix(inner, outer, t), 1.0);
+            }
+        }
+
+        // 固定步长 + 温和的幂律缩放（靠近视界自动变小，远场放大）
+        float ratio = max(r / horizonR, 1.0);
+        float scale = clamp(pow(ratio, 0.5), 0.1, 8.0);
+        rk4Step(pos, mom, h * scale, M, a, a2);
+
+        float curSide = pos.z - 1.57079632679;
+        if (prevSide * curSide < 0.0) {            // 符号翻转 = 穿过了赤道面
+            float r = pos.y;
+            if (r >= diskInner && r <= diskOuter) {
+                float t = clamp((r - diskInner) / max(diskOuter - diskInner, 0.01), 0.0, 1.0);
+                vec3 inner = vec3(0.6, 0.8, 1.0);
+                vec3 outer = vec3(1.0, 0.5, 0.2);
+                float bright = 0.5 + 0.5 * (1.0 - t);
+                return vec4(bright * mix(inner, outer, t), 1.0);
+            }
+        }
+        prevSide = curSide;
+    }
+
+    // 超出步数 — 暗灰（调试期可改成醒目颜色定位“没跑完”的像素）
+    return vec4(0.05, 0.05, 0.08, 1.0);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 第一块：Kerr 椭球半径 r(x, y, z)
+// ══════════════════════════════════════════════════════════════
+//
+// Kerr-Schild 笛卡尔坐标下，"半径" r 不是球坐标 √(x²+y²+z²)，
+// 而是 Kerr 特有的椭球坐标，由下式隐式定义：
+//
+//     x² + y² + z² = r² + a²(1 - z²/r²)
+//
+// 整理成关于 r² 的二次方程：
+//     r⁴ - (ρ² - a²)·r² - a²·z² = 0,   其中 ρ² = x² + y² + z²
+//
+// 解出正根：
+//     r² = ½[ (ρ² - a²) + √((ρ² - a²)² + 4a²z²) ]
+//
+// a = 0 时退化为 r² = ρ²，即普通球坐标半径（史瓦西）。
+// ══════════════════════════════════════════════════════════════
+
+float kerrRadius(vec3 p, float a2) {
+    float rho2 = dot(p, p);              // x² + y² + z²
+    float t    = rho2 - a2;
+    // 判别式恒 ≥ 0（4a²z² ≥ 0），但加 max 防浮点负零
+    float disc = sqrt(max(t * t + 4.0 * a2 * p.z * p.z, 0.0));
+    float r2   = 0.5 * (t + disc);
+    return sqrt(max(r2, 0.0));
+}
+
+vec3 debugRadiusColor(float r, float M) {
+    // 用视界半径 r_h = M + √(M²-a²) 做归一化基准
+    // 这里简单用 r / (10M) 映射到 [0,1] 的彩虹色带
+    float t = clamp(r / (10.0 * M), 0.0, 1.0);
+
+    // 简易 turbo-ish 彩虹：低 r 红 → 高 r 蓝，便于看清等值线
+    vec3 c;
+    c.r = clamp(1.5 - abs(4.0 * t - 3.0), 0.0, 1.0);
+    c.g = clamp(1.5 - abs(4.0 * t - 2.0), 0.0, 1.0);
+    c.b = clamp(1.5 - abs(4.0 * t - 1.0), 0.0, 1.0);
+
+    // 每 0.5M 画一条等值线（黑色细纹），凸显椭球形状
+    float ring = smoothstep(0.45, 0.5, fract(r / 0.5));
+    c *= (1.0 - 0.5 * ring);
+
+    return c;
+}
+
+// ══════════════════════════════════════════════════════════════
+// 第二块：Kerr-Schild 度规 g_μν 与逆度规 g^μν
+// ══════════════════════════════════════════════════════════════
+//
+// 坐标顺序：(t, x, y, z) = 指标 (0, 1, 2, 3)
+//
+// 核心结构（Kerr-Schild 形式）：
+//     g_μν = η_μν + f · l_μ · l_ν      （协变）
+//     g^μν = η^μν − f · l^μ · l^ν      （逆变，符号翻转）
+//
+// 其中：
+//     η_μν = diag(-1, +1, +1, +1)      闵可夫斯基
+//     f    = 2 M r³ / (r⁴ + a² z²)     标量
+//     l_μ  = (1, lx, ly, lz)           类光向量（协变，下指标）
+//          lx = (r x + a y) / (r² + a²)
+//          ly = (r y − a x) / (r² + a²)
+//          lz = z / r
+//
+// 关键性质：l 是 null（η^μν l_μ l_ν = 0），
+//          这保证了 g 和 g⁻¹ 互逆，且这个 f·l·l 修正项形式
+//          对协变/逆变只差一个符号 —— 不用解 4×4 矩阵求逆。
+//
+// 注意：l^μ（上指标）与 l_μ（下指标）的关系，
+//      因为 l 是 null 且 l_0 = 1：
+//          l^0 = η^00 l_0 = -1
+//          l^i = η^ii l_i = +l_i  (i = 1,2,3)
+//      即 l^μ = (-1, lx, ly, lz)，仅时间分量变号。
+// ══════════════════════════════════════════════════════════════
+
+// 一次性算好 f 和 l_μ（协变），避免重复计算
+// 返回：out_f = f，out_l = (l_0, l_1, l_2, l_3) = (1, lx, ly, lz)
+void kerrSchildScalars(vec3 p, float M, float a, float a2,
+out float out_f, out vec4 out_l) {
+    float r  = kerrRadius(p, a2);
+    float r2 = r * r;
+
+    float denom_l = r2 + a2;
+    // 防 r → 0（环奇点附近）时除零
+    float inv_denom_l = 1.0 / max(denom_l, 1e-12);
+
+    float lx = (r * p.x + a * p.y) * inv_denom_l;
+    float ly = (r * p.y - a * p.x) * inv_denom_l;
+    float lz = p.z / max(r, 1e-12);
+
+    out_l = vec4(1.0, lx, ly, lz);
+
+    float r4 = r2 * r2;
+    out_f = 2.0 * M * r2 * r / max(r4 + a2 * p.z * p.z, 1e-12);
+}
+
+// ── 协变度规分量 g_μν ──
+// η_μν = diag(-1,1,1,1)；g_μν = η_μν + f l_μ l_ν
+float metric_dn(int mu, int nu, float f, vec4 l) {
+    float eta = (mu == nu) ? (mu == 0 ? -1.0 : 1.0) : 0.0;
+    return eta + f * l[mu] * l[nu];
+}
+
+// ── 逆变度规分量 g^μν ──
+// η^μν = diag(-1,1,1,1)（闵可夫斯基逆 = 自身）
+// l^μ = (-1, lx, ly, lz)，仅时间分量变号
+// g^μν = η^μν − f l^μ l^ν
+float metric_up(int mu, int nu, float f, vec4 l) {
+    float eta = (mu == nu) ? (mu == 0 ? -1.0 : 1.0) : 0.0;
+    // 构造 l^μ：时间分量取负
+    float lup_mu = (mu == 0) ? -l[0] : l[mu];
+    float lup_nu = (nu == 0) ? -l[0] : l[nu];
+    return eta - f * lup_mu * lup_nu;
+}
+
+float metricInverseError(vec3 p, float M, float a, float a2) {
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+
+    float maxErr = 0.0;
+    for (int mu = 0; mu < 4; mu++) {
+        for (int nu = 0; nu < 4; nu++) {
+            // (g · g⁻¹)_μ^ν = Σ_α g_μα g^αν
+            float sum = 0.0;
+            for (int alpha = 0; alpha < 4; alpha++) {
+                sum += metric_dn(mu, alpha, f, l) * metric_up(alpha, nu, f, l);
+            }
+            float expected = (mu == nu) ? 1.0 : 0.0;
+            maxErr = max(maxErr, abs(sum - expected));
+        }
+    }
+    return maxErr;
+}
+
+// ══════════════════════════════════════════════════════════════
+// 第三块：数值 Christoffel + 测地线方程右端
+// ══════════════════════════════════════════════════════════════
+//
+// 直接复用第二块验证过的度规函数，不引入新公式。
+//
+// Christoffel 定义：
+//   Γ^μ_αβ = ½ g^μν (∂_α g_νβ + ∂_β g_να − ∂_ν g_αβ)
+//
+// 度规导数用中心差分：
+//   ∂_α g_νβ ≈ [g_νβ(x + h e_α) − g_νβ(x − h e_α)] / (2h)
+//
+// 注意：度规只依赖空间坐标 (x,y,z)，与 t 无关（静态时空），
+//       所以 ∂_0 g = 0，对 t 的导数直接跳过 → 省 1/4 计算。
+// ══════════════════════════════════════════════════════════════
+
+const float DIFF_H = 1e-3;   // 中心差分步长，太大不准、太小受浮点噪声
+
+// 在给定空间点算完整的协变度规 4×4（对称，存 10 个独立分量也行，
+// 这里为清晰用满 4×4 数组）
+void fullMetricDn(vec3 p, float M, float a, float a2, out float g[16]) {
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+    for (int mu = 0; mu < 4; mu++) {
+        for (int nu = 0; nu < 4; nu++) {
+            g[mu * 4 + nu] = metric_dn(mu, nu, f, l);
+        }
+    }
+}
+
+// 对空间方向 dir_idx (1=x, 2=y, 3=z) 求度规偏导 ∂g_νβ
+// 返回 4×4 的导数矩阵
+void metricSpatialDeriv(vec3 p, int dir_idx, float M, float a, float a2,
+out float dg[16]) {
+    vec3 e = vec3(0.0);
+    if (dir_idx == 1) e.x = DIFF_H;
+    else if (dir_idx == 2) e.y = DIFF_H;
+    else e.z = DIFF_H;
+
+    float gp[16]; fullMetricDn(p + e, M, a, a2, gp);
+    float gm[16]; fullMetricDn(p - e, M, a, a2, gm);
+
+    float inv2h = 1.0 / (2.0 * DIFF_H);
+    for (int i = 0; i < 16; i++) {
+        dg[i] = (gp[i] - gm[i]) * inv2h;
+    }
+}
+
+// ── 测地线右端 ──
+// 状态：pos = (t, x, y, z)，mom = p^μ = (p^t, p^x, p^y, p^z)
+// dx^μ/dλ = p^μ
+// dp^μ/dλ = −Γ^μ_αβ p^α p^β
+void geodesicRHS_KS(vec4 pos, vec4 mom, float M, float a, float a2,
+out vec4 dPos, out vec4 dMom) {
+    dPos = mom;
+
+    vec3 p = pos.yzw;   // 空间坐标 (x, y, z)
+
+    // 逆度规（用解析的 metric_up，不需要差分）
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+
+    // 预算三个空间方向的度规导数：dgArr[d] 是 ∂_d g（d=0对应x,1对应y,2对应z）
+    // ∂_t g = 0（静态），所以只需空间三个
+    float dg_x[16]; metricSpatialDeriv(p, 1, M, a, a2, dg_x);
+    float dg_y[16]; metricSpatialDeriv(p, 2, M, a, a2, dg_y);
+    float dg_z[16]; metricSpatialDeriv(p, 3, M, a, a2, dg_z);
+
+    // 取 ∂_α g_νβ 的辅助函数（alpha: 0=t→全0, 1=x, 2=y, 3=z）
+    // 用宏式内联：把 alpha 映射到对应导数数组
+    // GLSL 无法返回数组引用，所以下面在循环里直接分支取值
+
+    // 计算 dp^μ/dλ = −Γ^μ_αβ p^α p^β
+    //              = −½ g^μν (∂_α g_νβ + ∂_β g_να − ∂_ν g_αβ) p^α p^β
+    vec4 dMomTmp = vec4(0.0);
+
+    for (int mu = 0; mu < 4; mu++) {
+        float acc = 0.0;
+        for (int nu = 0; nu < 4; nu++) {
+            float gup = metric_up(mu, nu, f, l);
+            if (abs(gup) < 1e-30) continue;
+
+            // 对 α, β 求和：(∂_α g_νβ + ∂_β g_να − ∂_ν g_αβ) p^α p^β
+            float inner = 0.0;
+            for (int alpha = 0; alpha < 4; alpha++) {
+                float pa = mom[alpha];
+                if (pa == 0.0) continue;
+                for (int beta = 0; beta < 4; beta++) {
+                    float pb = mom[beta];
+                    if (pb == 0.0) continue;
+
+                    // ∂_α g_νβ
+                    float d_a_g_nb =
+                    (alpha == 1) ? dg_x[nu*4 + beta] :
+                    (alpha == 2) ? dg_y[nu*4 + beta] :
+                    (alpha == 3) ? dg_z[nu*4 + beta] : 0.0;  // alpha==0 → 0
+
+                    // ∂_β g_να
+                    float d_b_g_na =
+                    (beta == 1) ? dg_x[nu*4 + alpha] :
+                    (beta == 2) ? dg_y[nu*4 + alpha] :
+                    (beta == 3) ? dg_z[nu*4 + alpha] : 0.0;
+
+                    // ∂_ν g_αβ
+                    float d_n_g_ab =
+                    (nu == 1) ? dg_x[alpha*4 + beta] :
+                    (nu == 2) ? dg_y[alpha*4 + beta] :
+                    (nu == 3) ? dg_z[alpha*4 + beta] : 0.0;
+
+                    inner += (d_a_g_nb + d_b_g_na - d_n_g_ab) * pa * pb;
+                }
+            }
+            acc += gup * inner;
+        }
+        dMomTmp[mu] = -0.5 * acc;
+    }
+
+    dMom = dMomTmp;
+}
+
+// ── 固定步长 RK4（结构和你之前一样，只是换了 RHS 函数）──
+void rk4Step_KS(inout vec4 pos, inout vec4 mom, float h,
+float M, float a, float a2) {
+    vec4 k1p, k1m; geodesicRHS_KS(pos, mom, M, a, a2, k1p, k1m);
+    vec4 k2p, k2m; geodesicRHS_KS(pos + 0.5*h*k1p, mom + 0.5*h*k1m, M, a, a2, k2p, k2m);
+    vec4 k3p, k3m; geodesicRHS_KS(pos + 0.5*h*k2p, mom + 0.5*h*k2m, M, a, a2, k3p, k3m);
+    vec4 k4p, k4m; geodesicRHS_KS(pos + h*k3p,     mom + h*k3m,     M, a, a2, k4p, k4m);
+
+    pos += (h / 6.0) * (k1p + 2.0*k2p + 2.0*k3p + k4p);
+    mom += (h / 6.0) * (k1m + 2.0*k2m + 2.0*k3m + k4m);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 守恒量自检 —— 验证 Christoffel 是否正确
+// ══════════════════════════════════════════════════════════════
+//
+// 静态轴对称时空有两个守恒量（沿测地线不变）：
+//   能量    E = −p_t = −g_0ν p^ν
+//   角动量  L_z = p_φ = (绕 z 轴) = x p_y − y p_x  的协变版
+//                = g_2ν p^ν · (∂/∂φ 投影)...
+//
+// 简化做法：直接用协变动量 p_t 和绕轴角动量。
+//   p_t   = g_tν p^ν          （应守恒 → 能量）
+//   L_z   = g_φν p^ν，其中 ∂_φ = x ∂_y − y ∂_x
+//         → L_z = x·(g_2ν p^ν) − y·(g_1ν p^ν)
+//
+// 沿测地线积分若干步，比较起点/终点的 E 和 L_z，
+// 漂移越小说明 Christoffel 越准。把漂移映射成颜色：
+//   全黑 = 守恒（正确），发亮 = 不守恒（Christoffel 有错）。
+// ══════════════════════════════════════════════════════════════
+
+float covariant_pt(vec3 p, vec4 mom, float M, float a, float a2) {
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+    // p_t = g_0ν p^ν
+    float pt = 0.0;
+    for (int nu = 0; nu < 4; nu++) pt += metric_dn(0, nu, f, l) * mom[nu];
+    return pt;
+}
+
+float angularMomentum_z(vec3 p, vec4 mom, float M, float a, float a2) {
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+    // p_x = g_1ν p^ν, p_y = g_2ν p^ν
+    float px = 0.0, py = 0.0;
+    for (int nu = 0; nu < 4; nu++) {
+        px += metric_dn(1, nu, f, l) * mom[nu];
+        py += metric_dn(2, nu, f, l) * mom[nu];
+    }
+    // L_z = x p_y − y p_x
+    return p.x * py - p.y * px;
+}
+
+// ══════════════════════════════════════════════════════════════
+// 第四块：完整追踪 —— Kerr-Schild 笛卡尔坐标
+// ══════════════════════════════════════════════════════════════
+//
+// 依赖前三块（必须已在同一文件中、且验证通过）：
+//   kerrRadius(p, a2)
+//   kerrSchildScalars(p, M, a, a2, out f, out l)
+//   metric_dn(mu, nu, f, l) / metric_up(mu, nu, f, l)
+//   geodesicRHS_KS(pos, mom, M, a, a2, out dPos, out dMom)
+//   rk4Step_KS(pos, mom, h, M, a, a2)
+//
+// 坐标：pos = (t, x, y, z)，mom = p^μ = (p^t, p^x, p^y, p^z)
+// 黑洞在原点，自转轴 = z 轴，赤道面 = z=0 平面。
+// ══════════════════════════════════════════════════════════════
+
+// ── 背景天空（直接用笛卡尔方向，不再需要 blToCartesian）──
+//vec3 sampleBackground(vec3 dir) {
+//    vec3 d = normalize(dir);
+//    float galaxy = exp(-abs(d.z) * 6.0) * 0.12;   // 注意：用 d.z（自转轴），银河带绕赤道
+//    vec3 bg = vec3(galaxy * 0.3, galaxy * 0.4, galaxy * 0.7);
+//    vec3 sd = floor(d * 250.0);
+//    float hsh = fract(sin(dot(sd, vec3(127.1, 311.7, 74.3))) * 43758.5453);
+//    float star = step(0.9975, hsh);
+//    bg += vec3(0.7, 0.8, 1.0) * star * (0.3 + 0.7 * fract(hsh * 83.27));
+//    return bg;
+//}
+
+// ── 吸积盘着色（按半径冷暖渐变）──
+vec3 diskColor(float r, float diskInner, float diskOuter) {
+    float t = clamp((r - diskInner) / max(diskOuter - diskInner, 0.01), 0.0, 1.0);
+    vec3 inner = vec3(1.0, 0.95, 0.85);   // 内盘热，近白
+    vec3 outer = vec3(1.0, 0.45, 0.15);   // 外盘冷，橙红
+    float bright = 0.4 + 0.8 * (1.0 - t); // 内盘更亮
+    return bright * mix(inner, outer, t);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 类光初始动量：给定相机位置和空间方向，解 p^t 使光子 null
+//   g_tt (p^t)² + 2 g_ti p^t dir^i + g_ij dir^i dir^j = 0
+// ══════════════════════════════════════════════════════════════
+
+vec4 makeNullMomentum(vec3 camPos, vec3 dir, float M, float a, float a2) {
+    float f; vec4 l;
+    kerrSchildScalars(camPos, M, a, a2, f, l);
+
+    float g_tt = metric_dn(0, 0, f, l);
+    float B = 0.0, C = 0.0;
+    for (int i = 1; i < 4; i++) {
+        B += 2.0 * metric_dn(0, i, f, l) * dir[i-1];
+        for (int j = 1; j < 4; j++) {
+            C += metric_dn(i, j, f, l) * dir[i-1] * dir[j-1];
+        }
+    }
+    float disc = max(B*B - 4.0*g_tt*C, 0.0);
+    float sq = sqrt(disc);
+    // 取"未来指向"的根：p^t > 0
+    float pt = (-B - sq) / (2.0 * g_tt);
+    if (pt < 0.0) pt = (-B + sq) / (2.0 * g_tt);
+
+    return vec4(pt, dir);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 主追踪：固定步长 RK4，z=0 穿越检测盘面，椭球 r 判视界
+// ══════════════════════════════════════════════════════════════
+
+vec4 tracePhotonKS(vec3 camPos, vec3 dir,
+float M, float a, float a2,
+float horizonR, float escapeR,
+float diskInner, float diskOuter,
+float baseH, int maxSteps) {
+    vec4 pos = vec4(0.0, camPos);
+    vec4 mom = makeNullMomentum(camPos, dir, M, a, a2);
+
+    float prevZ = pos.w;   // 上一步的 z，用于赤道面穿越检测
+
+    for (int i = 0; i < maxSteps; i++) {
+        vec3 p = pos.yzw;
+        float r = kerrRadius(p, a2);
+
+        // ── 捕获：椭球 r 进入视界 ──
+        if (r < horizonR * 1.01) {
+            return vec4(0.0, 0.0, 0.0, 1.0);
+        }
+
+        // ── 逃逸：远场（用普通距离判，够远就出去）──
+        if (length(p) > escapeR) {
+            return vec4(sampleBackground(dir), 1.0);
+        }
+
+        // ── 步长：靠近视界变小，远场放大（用椭球 r）──
+        float ratio = max(r / horizonR, 1.0);
+        float scale = clamp(pow(ratio, 0.5), 0.08, 8.0);
+        float h = baseH * scale;
+
+        // 记录步进前的 z
+        prevZ = pos.w;
+        rk4Step_KS(pos, mom, h, M, a, a2);
+
+        // ── 盘面：检测 z 是否跨过 0（赤道面）──
+        if (prevZ * pos.w < 0.0) {
+            // 线性插值出穿越点的半径（更准）
+            float frac = prevZ / (prevZ - pos.w);  // ∈ [0,1]
+            vec3 cross = mix(vec3(0.0) + vec3(0.0), pos.yzw, 1.0); // 占位
+            // 用步进前后插值穿越点（pos 已是步后，prevZ 是步前 z）
+            // 近似：穿越点 xy 用步后位置即可（薄盘，误差小）
+            float rCross = kerrRadius(pos.yzw, a2);
+            if (rCross >= diskInner && rCross <= diskOuter) {
+                return vec4(diskColor(rCross, diskInner, diskOuter), 1.0);
+            }
+        }
+    }
+
+    // 超步数 —— 调试期用品红，定位"没跑完"的像素
+    return vec4(1.0, 0.0, 1.0, 1.0);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 主入口
+// ══════════════════════════════════════════════════════════════
+
+void main() {
+    ivec2 pix  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outImage);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    float M  = spacetime.bhParams.x;
+    float a  = spacetime.bhParams.y;
+    float a2 = a * a;
+
+    // 视界半径（外视界）r_h = M + √(M² − a²)
+    float horizonR = M + sqrt(max(M*M - a2, 0.0));
+
+    float diskInner = spacetime.diskParams.x;
+    float diskOuter = spacetime.diskParams.y;
+
+    vec3 camPos = cam.camPos.xyz;
+
+    // NDC → 笛卡尔
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec4 wd4 = cam.invViewProj * vec4(uv, 1.0, 1.0);
+    vec3 dir = normalize(wd4.xyz / wd4.w - camPos);
+
+    vec4 color = tracePhotonKS(camPos, dir,
+    M, a, a2,
+    horizonR, cam.escapeRadius,
+    diskInner, diskOuter,
+    cam.stepSize, cam.maxSteps);
+
+    imageStore(outImage, pix, color);
+}
+
+

@@ -5,6 +5,10 @@
 #include "vulkan_app.h"
 #include "vulkan_util.h"
 #include "command_buffer.h"
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 
 VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr) {
@@ -12,15 +16,26 @@ VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr) {
     context_ = std::make_unique<VulkanContext>(w, h);
     window_ = context_->window();
 
+    // GLFW 输入回调 — 用 user pointer 回找 VulkanApp 实例
+    glfwSetWindowUserPointer(window_, this);
+    glfwSetKeyCallback(window_, key_callback);
+    glfwSetMouseButtonCallback(window_, mouse_button_callback);
+    glfwSetCursorPosCallback(window_, cursor_pos_callback);
+    glfwSetScrollCallback(window_, scroll_callback);
+
     // GPU Buffer
+    // CameraUBO: vec4 camPos(16) + mat4 invViewProj(64) + float stepSize(4) +
+    // int maxSteps(4) + float escapeRadius(4) + float pad(4) = 96 bytes
     camera_ubo_ = std::make_unique<GPUBuffer>(
-        context_.get(), 64,
+        context_.get(), 96,
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
+    // SpacetimeUBO: vec4 bhParams(16) + vec4 integratorParams(16) +
+    // vec4 diskParams(16) = 48 bytes
     spacetime_ubo_ = std::make_unique<GPUBuffer>(
-        context_.get(), 64,
+        context_.get(), 48,
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -105,7 +120,7 @@ VulkanApp::VulkanApp(uint32_t w, uint32_t h) : context_(nullptr) {
     // Pipeline
     compute_pipeline_ = std::make_unique<ComputePipeline>(
         context_.get(),
-        "shaders/geodesic.comp.spv",
+        "shaders/geodesic_minimal.comp.spv",
         compute_pipeline_layout_);
 
     {
@@ -158,8 +173,10 @@ VulkanApp::~VulkanApp() {
     }
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         vkDestroySemaphore(context_->device(), image_available_semaphores_[i], nullptr);
-        vkDestroySemaphore(context_->device(), render_finished_semaphores_[i], nullptr);
         vkDestroyFence(context_->device(), frame_fences_[i], nullptr);
+    }
+    for (VkSemaphore sem : render_finished_semaphores_) {
+        vkDestroySemaphore(context_->device(), sem, nullptr);
     }
 }
 
@@ -168,15 +185,22 @@ void VulkanApp::run() {
 }
 
 void VulkanApp::create_sync_objects() {
+    uint32_t image_count = context_->swapchain_view_count();
+
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         image_available_semaphores_[i] = vulkan_util::create_semaphore(context_->device());
-        render_finished_semaphores_[i] = vulkan_util::create_semaphore(context_->device());
         frame_fences_[i] = vulkan_util::create_fence(
             context_->device(),
             VK_FENCE_CREATE_SIGNALED_BIT // 首帧直接通过
         );
     }
-    uint32_t image_count = context_->swapchain_view_count();
+
+    // render_finished: 每 swapchain image 一个，避免 present 异步持有时复用
+    render_finished_semaphores_.resize(image_count);
+    for (uint32_t i = 0; i < image_count; i++) {
+        render_finished_semaphores_[i] = vulkan_util::create_semaphore(context_->device());
+    }
+
     images_in_flight_.resize(image_count, VK_NULL_HANDLE);
 }
 
@@ -249,7 +273,7 @@ void VulkanApp::create_descriptor_sets() {
         vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
     }
 
-    // 分配与更新 graphics 描述集
+    // 分配与更新 graphics 描述符集
     {
         VkDescriptorSetAllocateInfo alloc_info{};
         alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -279,13 +303,99 @@ void VulkanApp::create_descriptor_sets() {
 }
 
 void VulkanApp::update_ubos() {
-    void* data = camera_ubo_->map();
-    std::memset(data, 0, camera_ubo_->size());
-    camera_ubo_->unmap();
+    float w = static_cast<float>(context_->window_width());
+    float h = static_cast<float>(context_->window_height());
+    float aspect = (h > 0.0f) ? (w / h) : 1.0f;
 
-    data = spacetime_ubo_->map();
-    std::memset(data, 0, spacetime_ubo_->size());
-    spacetime_ubo_->unmap();
+    // ── 场景参数 ──
+    float M = 1.0f;
+    float a = 0.0f;
+    float a2 = a * a;
+    float horizon_r = M + std::sqrt(M * M - a2);
+    float inner_r   = M - std::sqrt(M * M - a2);
+
+    // ── FPV Camera ──
+    // forward from yaw/pitch: 绕 +z 的方位角 + 离 xy-plane 的抬角
+    float cy = std::cos(camera_.pitch);
+    glm::vec3 forward(
+        cy * std::cos(camera_.yaw),
+        cy * std::sin(camera_.yaw),
+        std::sin(camera_.pitch)
+    );
+    glm::vec3 worldUp(0.0f, 0.0f, 1.0f);  // 黑洞自转轴
+    glm::vec3 eye = camera_.position;
+    glm::vec3 center = eye + forward;       // 看向前方
+
+    // ── 相机笛卡尔坐标 (shader 接受 Cartesian) ──
+    glm::vec3 cam_cartesian = eye;
+
+    // ── 视图 + 投影矩阵 ──
+    glm::mat4 view = glm::lookAt(eye, center, worldUp);
+    glm::mat4 proj = glm::perspective(glm::radians(camera_.fov), aspect, 0.1f, 1000.0f);
+    // Vulkan NDC: y 轴向下 (与 OpenGL 相反)，翻转 y
+    proj[1][1] *= -1.0f;
+    glm::mat4 invVP = glm::inverse(proj * view);
+
+    // camera r (到原点的距离，用于 stepSize / escapeRadius)
+    float cam_r = glm::length(cam_cartesian);
+
+    // CameraUBO (std140): vec4 camPos | mat4 invViewProj | float stepSize |
+    // int maxSteps | float escapeRadius | float pad
+    {
+        void* data = camera_ubo_->map();
+        float* f = static_cast<float*>(data);
+
+        // camPos (offset 0, 16B): 相机笛卡尔坐标 (x, y, z, 0)
+        f[0] = cam_cartesian.x;
+        f[1] = cam_cartesian.y;
+        f[2] = cam_cartesian.z;
+        f[3] = 0.0f;
+
+        // invViewProj (offset 16, 64B): 逆 VP 矩阵 (列主序)
+        std::memcpy(f + 4, glm::value_ptr(invVP), 64 * sizeof(float));
+
+        // stepSize (offset 80, 4B)
+        f[20] = 0.1f * glm::max(1.0f, cam_r / 15.0f);
+
+        // maxSteps (offset 84, 4B)
+        *reinterpret_cast<int32_t*>(&f[21]) = 1024;
+
+        // escapeRadius (offset 88, 4B)
+        f[22] = glm::max(50.0f, cam_r * 1.5f);
+
+        // pad (offset 92, 4B)
+        f[23] = 0.0f;
+
+        camera_ubo_->unmap();
+    }
+
+    // SpacetimeUBO (std140): vec4 bhParams | vec4 integratorParams |
+    // vec4 diskParams
+    {
+        void* data = spacetime_ubo_->map();
+        float* f = static_cast<float*>(data);
+
+        // bhParams: M, a, horizon_radius, inner_horizon_radius
+        f[0] = M;
+        f[1] = a;
+        f[2] = horizon_r;
+        f[3] = inner_r;
+
+        // integratorParams: tolerance, minStepSize, maxStepSize, safety
+        f[4] = 1e-6f;
+        f[5] = 0.001f;
+        f[6] = 1.0f;
+        f[7] = 0.9f;
+
+        // diskParams: inner_r, outer_r, height, pad
+        // ISCO prograde ≈ 4.6M for a=0.5, 保守取 5M
+        f[8]  = 5.0f;
+        f[9]  = 25.0f;
+        f[10] = 0.02f;
+        f[11] = 0.0f;
+
+        spacetime_ubo_->unmap();
+    }
 }
 
 void VulkanApp::main_loop() {
@@ -474,11 +584,84 @@ void VulkanApp::step_frame() {
     cmd.end();
 
     // Submit and present
+    // render_finished 按 image_index 索引: 每个 swapchain image 有独立 semaphore，
+    // 避免 current_frame_ 回绕时 presentation engine 还持有旧 semaphore
     context_->submit(cmd.handle(),
                      image_available_semaphores_[current_frame_],
-                     render_finished_semaphores_[current_frame_],
+                     render_finished_semaphores_[image_index],
                      fence);
-    context_->present(image_index, render_finished_semaphores_[current_frame_]);
+    context_->present(image_index, render_finished_semaphores_[image_index]);
 
     current_frame_ = (current_frame_ + 1) % MAX_FRAMES_IN_FLIGHT;
+}
+
+// ══════════════════════════════════════════════════════════════
+// GLFW 回调 — FPV Camera 控制
+// ══════════════════════════════════════════════════════════════
+
+void VulkanApp::key_callback(GLFWwindow* w, int key, int scancode, int action, int mods) {
+    auto* app = static_cast<VulkanApp*>(glfwGetWindowUserPointer(w));
+    if (!app) return;
+
+    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+
+    // 相机局部坐标系 (forward/right/up in world space)
+    float cy = std::cos(app->camera_.pitch);
+    glm::vec3 forward(
+        cy * std::cos(app->camera_.yaw),
+        cy * std::sin(app->camera_.yaw),
+        std::sin(app->camera_.pitch)
+    );
+    glm::vec3 worldUp(0.0f, 0.0f, 1.0f);
+    glm::vec3 right = glm::normalize(glm::cross(forward, worldUp));
+    glm::vec3 up    = glm::cross(right, forward);
+
+    float s = app->camera_.move_speed;
+    switch (key) {
+        case GLFW_KEY_W: app->camera_.position += forward * s; break;
+        case GLFW_KEY_S: app->camera_.position -= forward * s; break;
+        case GLFW_KEY_A: app->camera_.position -= right   * s; break;
+        case GLFW_KEY_D: app->camera_.position += right   * s; break;
+        case GLFW_KEY_LEFT_SHIFT: app->camera_.position -= worldUp * s; break;  // 降
+        case GLFW_KEY_SPACE: app->camera_.position += worldUp * s; break;  // 升
+        default: break;
+    }
+}
+
+void VulkanApp::mouse_button_callback(GLFWwindow* w, int button, int action, int mods) {
+    auto* app = static_cast<VulkanApp*>(glfwGetWindowUserPointer(w));
+    if (!app) return;
+
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        app->looking_ = (action == GLFW_PRESS);
+        if (action == GLFW_PRESS) {
+            glfwGetCursorPos(w, &app->last_mouse_x_, &app->last_mouse_y_);
+        }
+    }
+}
+
+void VulkanApp::cursor_pos_callback(GLFWwindow* w, double xpos, double ypos) {
+    auto* app = static_cast<VulkanApp*>(glfwGetWindowUserPointer(w));
+    if (!app || !app->looking_) return;
+
+    double dx = xpos - app->last_mouse_x_;
+    double dy = ypos - app->last_mouse_y_;
+    app->last_mouse_x_ = xpos;
+    app->last_mouse_y_ = ypos;
+
+    float s = app->camera_.look_sensitivity;
+    app->camera_.yaw   -= static_cast<float>(dx) * s;
+    app->camera_.pitch -= static_cast<float>(dy) * s;  // GLFW +y=下, 上推鼠标=抬头=pitch+
+
+    // clamp pitch to avoid flip
+    const float limit = glm::radians(89.0f);
+    app->camera_.pitch = std::max(-limit, std::min(limit, app->camera_.pitch));
+}
+
+void VulkanApp::scroll_callback(GLFWwindow* w, double xoffset, double yoffset) {
+    auto* app = static_cast<VulkanApp*>(glfwGetWindowUserPointer(w));
+    if (!app) return;
+
+    app->camera_.fov -= static_cast<float>(yoffset) * 2.0f;
+    app->camera_.fov = std::max(10.0f, std::min(120.0f, app->camera_.fov));
 }

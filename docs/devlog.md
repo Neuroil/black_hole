@@ -1032,3 +1032,78 @@ Stage 4 和 Stage 5 的实现完成后，文档未及时更新。`CLAUDE.md` 的
   - 修正所有 RAII 类构造函数签名（`const VulkanContext*` 替代 `const VulkanContext&`）
   - 更新所有权树 + 初始化顺序 + 设计演进记录（v5）
 - **docs/devlog.md**：本文件——补充 Stage 4、Stage 5、文档同步三段的开发记录
+
+---
+
+## 2026-06-08 — FPV Camera + UBO 数据 + Shader 管线重构 + 同步修复
+
+### 背景
+
+Stage 5 完成后，VulkanApp 的三阶段管线已跑通，但几个关键系统仍是占位状态：UBO 数据全为零（`memset`）、compute shader 只是简化牛顿引力透镜、没有任何交互控制。本次批量推进了四个方向。
+
+### FPV Camera 控制
+
+实现了第一人称自由相机（无轨道、无 target point），替代原先静止的固定视角：
+
+- **FPCamera 状态**：`position`（世界坐标，初始 `(0, 15, 5)`）+ `yaw`/`pitch`（球坐标朝向）+ `fov`（垂直视场角）
+- **输入映射**：
+  - WASD —— 沿相机 forward/right 方向移动
+  - Left Shift / Space —— 沿世界 Z 轴（黑洞自转轴）下降/上升
+  - 鼠标左键拖拽 —— 环视（yaw/pitch 调整），pitch clamp 到 ±89° 防止翻转
+  - 滚轮 —— FOV 缩放（10°–120°）
+- **实现方式**：GLFW static 回调 + `glfwSetWindowUserPointer` 回找 `VulkanApp*` 实例。四个回调（key/mouse_button/cursor_pos/scroll）在 `VulkanApp` 构造函数中注册
+
+相机状态通过 `update_ubos()` 每帧同步到 GPU 端 CameraUBO。
+
+### UBO 实际数据
+
+`update_ubos()` 从 `memset` 零填充改为实际物理数据：
+
+**CameraUBO**（96 bytes, std140）：
+| offset | 字段 | 说明 |
+|--------|------|------|
+| 0 | `vec4 camPos` | 相机笛卡尔坐标 (x, y, z, 0) |
+| 16 | `mat4 invViewProj` | 逆 VP 矩阵，用于屏幕像素反投影到世界光线方向 |
+| 80 | `float stepSize` | RK4 积分步长，随相机距离自适应（`0.1 * max(1, r/15)`） |
+| 84 | `int maxSteps` | 最大积分步数（1024） |
+| 88 | `float escapeRadius` | 逃逸判定半径（`max(50, r*1.5)`） |
+
+**SpacetimeUBO**（48 bytes, std140）：
+| offset | 字段 | 说明 |
+|--------|------|------|
+| 0 | `vec4 bhParams` | M, a, horizon_radius, inner_horizon_radius |
+| 16 | `vec4 integratorParams` | tolerance (1e-6), minStepSize (0.001), maxStepSize (1.0), safety (0.9) |
+| 32 | `vec4 diskParams` | inner_r (ISCO≈5M), outer_r (25M), height (0.02), pad |
+
+视图矩阵使用标准 `glm::lookAt` + `glm::perspective`，注意 Vulkan NDC 的 y 轴向下——`proj[1][1] *= -1.0f` 翻转。
+
+### Shader 管线重构
+
+**旧状态**：`geodesic.comp` 是一个简化占位——内部只用牛顿引力透镜近似（`geodesicAccel` 仅含 1/r² 项），不对应 Kerr 度规的 Christoffel 符号。
+
+**新状态**：
+
+- `geodesic.comp` → 重命名为 `geodesic.comp.old`（保留作参考，不参与构建）
+- 新增 `geodesic_minimal.comp` —— 完整 Kerr 度规 Christoffel 实时计算的 compute shader，作为运行时使用的 shader
+- 新增四个实验性分块 shader（`ks_block1_radius.comp` / `ks_block2_metric.comp` / `ks_block3_christoffel.comp` / `ks_block4_tracer.comp`），将测地线积分的四个阶段拆成独立模块供验证和调优。当前**不接入运行时**，仅为实验参考
+- CMake 构建规则重构：从硬编码 `compile_shader(geodesic.comp)` / `compile_shader(fullscreen.vert)` 等改为 `file(GLOB)` 自动发现 `shaders/*.comp|.vert|.frag`，通过 `list(FILTER ... EXCLUDE REGEX "ks_block")` 和 `list(FILTER ... EXCLUDE REGEX "\\.old$")` 排除不需要的文件
+
+### 同步修复：render_finished 竞态
+
+**问题**：原先 `render_finished_semaphores_` 以 `current_frame_` 索引（`VkSemaphore[MAX_FRAMES_IN_FLIGHT]`）。当 swapchain image 数量 > MAX_FRAMES_IN_FLIGHT 时，`current_frame_` 回绕可能导致 presentation engine 还持有一个旧 image 的 semaphore 时就被新一帧复用——这是 Vulkan spec 禁止的（semaphore 在 unsignaled 状态不能被 re-submit）。
+
+**修复**：`render_finished_semaphores_` 改为 `std::vector<VkSemaphore>`，按 `image_index` 索引——每个 swapchain image 拥有独立的 semaphore。`submit()` 和 `present()` 调用都改用 `render_finished_semaphores_[image_index]`。
+
+### VulkanContext debug 输出
+
+在 `is_physical_device_ok()` 中，非 NDEBUG 构建时输出选中的物理设备名，方便确认实际使用的 GPU。
+
+### 文件变更
+
+- 修改 `src/vulkan/vulkan_app.h`：新增 FPCamera + 鼠标状态 + 四个 GLFW static 回调声明；`render_finished_semaphores_` 类型改为 `std::vector<VkSemaphore>`
+- 修改 `src/vulkan/vulkan_app.cpp`：GLFW 回调注册 + 四个回调实现 + `update_ubos()` 实际数据填充 + `create_sync_objects()` 适配 per-swapchain-image semaphore + submit/present 改用 `image_index` 索引
+- 修改 `src/CMakeLists.txt`：shader 自动发现 + 排除规则
+- 修改 `src/vulkan/vulkan_context.cpp`：debug 物理设备名输出
+- 删除 `shaders/geodesic.comp`，新增 `shaders/geodesic.comp.old`
+- 新增 `shaders/geodesic_minimal.comp`
+- 新增 `shaders/ks_block1_radius.comp` / `ks_block2_metric.comp` / `ks_block3_christoffel.comp` / `ks_block4_tracer.comp`

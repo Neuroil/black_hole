@@ -1,0 +1,238 @@
+// ══════════════════════════════════════════════════════════════
+// 第三块：数值 Christoffel + 测地线方程右端
+// ══════════════════════════════════════════════════════════════
+//
+// 直接复用第二块验证过的度规函数，不引入新公式。
+//
+// Christoffel 定义：
+//   Γ^μ_αβ = ½ g^μν (∂_α g_νβ + ∂_β g_να − ∂_ν g_αβ)
+//
+// 度规导数用中心差分：
+//   ∂_α g_νβ ≈ [g_νβ(x + h e_α) − g_νβ(x − h e_α)] / (2h)
+//
+// 注意：度规只依赖空间坐标 (x,y,z)，与 t 无关（静态时空），
+//       所以 ∂_0 g = 0，对 t 的导数直接跳过 → 省 1/4 计算。
+// ══════════════════════════════════════════════════════════════
+
+const float DIFF_H = 1e-4;   // 中心差分步长，太大不准、太小受浮点噪声
+
+// 在给定空间点算完整的协变度规 4×4（对称，存 10 个独立分量也行，
+// 这里为清晰用满 4×4 数组）
+void fullMetricDn(vec3 p, float M, float a, float a2, out float g[16]) {
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+    for (int mu = 0; mu < 4; mu++) {
+        for (int nu = 0; nu < 4; nu++) {
+            g[mu * 4 + nu] = metric_dn(mu, nu, f, l);
+        }
+    }
+}
+
+// 对空间方向 dir_idx (1=x, 2=y, 3=z) 求度规偏导 ∂g_νβ
+// 返回 4×4 的导数矩阵
+void metricSpatialDeriv(vec3 p, int dir_idx, float M, float a, float a2,
+                        out float dg[16]) {
+    vec3 e = vec3(0.0);
+    if (dir_idx == 1) e.x = DIFF_H;
+    else if (dir_idx == 2) e.y = DIFF_H;
+    else e.z = DIFF_H;
+
+    float gp[16]; fullMetricDn(p + e, M, a, a2, gp);
+    float gm[16]; fullMetricDn(p - e, M, a, a2, gm);
+
+    float inv2h = 1.0 / (2.0 * DIFF_H);
+    for (int i = 0; i < 16; i++) {
+        dg[i] = (gp[i] - gm[i]) * inv2h;
+    }
+}
+
+// ── 测地线右端 ──
+// 状态：pos = (t, x, y, z)，mom = p^μ = (p^t, p^x, p^y, p^z)
+// dx^μ/dλ = p^μ
+// dp^μ/dλ = −Γ^μ_αβ p^α p^β
+void geodesicRHS_KS(vec4 pos, vec4 mom, float M, float a, float a2,
+                    out vec4 dPos, out vec4 dMom) {
+    dPos = mom;
+
+    vec3 p = pos.yzw;   // 空间坐标 (x, y, z)
+
+    // 逆度规（用解析的 metric_up，不需要差分）
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+
+    // 预算三个空间方向的度规导数：dgArr[d] 是 ∂_d g（d=0对应x,1对应y,2对应z）
+    // ∂_t g = 0（静态），所以只需空间三个
+    float dg_x[16]; metricSpatialDeriv(p, 1, M, a, a2, dg_x);
+    float dg_y[16]; metricSpatialDeriv(p, 2, M, a, a2, dg_y);
+    float dg_z[16]; metricSpatialDeriv(p, 3, M, a, a2, dg_z);
+
+    // 取 ∂_α g_νβ 的辅助函数（alpha: 0=t→全0, 1=x, 2=y, 3=z）
+    // 用宏式内联：把 alpha 映射到对应导数数组
+    // GLSL 无法返回数组引用，所以下面在循环里直接分支取值
+
+    // 计算 dp^μ/dλ = −Γ^μ_αβ p^α p^β
+    //              = −½ g^μν (∂_α g_νβ + ∂_β g_να − ∂_ν g_αβ) p^α p^β
+    vec4 dMomTmp = vec4(0.0);
+
+    for (int mu = 0; mu < 4; mu++) {
+        float acc = 0.0;
+        for (int nu = 0; nu < 4; nu++) {
+            float gup = metric_up(mu, nu, f, l);
+            if (abs(gup) < 1e-30) continue;
+
+            // 对 α, β 求和：(∂_α g_νβ + ∂_β g_να − ∂_ν g_αβ) p^α p^β
+            float inner = 0.0;
+            for (int alpha = 0; alpha < 4; alpha++) {
+                float pa = mom[alpha];
+                if (pa == 0.0) continue;
+                for (int beta = 0; beta < 4; beta++) {
+                    float pb = mom[beta];
+                    if (pb == 0.0) continue;
+
+                    // ∂_α g_νβ
+                    float d_a_g_nb =
+                        (alpha == 1) ? dg_x[nu*4 + beta] :
+                        (alpha == 2) ? dg_y[nu*4 + beta] :
+                        (alpha == 3) ? dg_z[nu*4 + beta] : 0.0;  // alpha==0 → 0
+
+                    // ∂_β g_να
+                    float d_b_g_na =
+                        (beta == 1) ? dg_x[nu*4 + alpha] :
+                        (beta == 2) ? dg_y[nu*4 + alpha] :
+                        (beta == 3) ? dg_z[nu*4 + alpha] : 0.0;
+
+                    // ∂_ν g_αβ
+                    float d_n_g_ab =
+                        (nu == 1) ? dg_x[alpha*4 + beta] :
+                        (nu == 2) ? dg_y[alpha*4 + beta] :
+                        (nu == 3) ? dg_z[alpha*4 + beta] : 0.0;
+
+                    inner += (d_a_g_nb + d_b_g_na - d_n_g_ab) * pa * pb;
+                }
+            }
+            acc += gup * inner;
+        }
+        dMomTmp[mu] = -0.5 * acc;
+    }
+
+    dMom = dMomTmp;
+}
+
+// ── 固定步长 RK4（结构和你之前一样，只是换了 RHS 函数）──
+void rk4Step_KS(inout vec4 pos, inout vec4 mom, float h,
+                float M, float a, float a2) {
+    vec4 k1p, k1m; geodesicRHS_KS(pos, mom, M, a, a2, k1p, k1m);
+    vec4 k2p, k2m; geodesicRHS_KS(pos + 0.5*h*k1p, mom + 0.5*h*k1m, M, a, a2, k2p, k2m);
+    vec4 k3p, k3m; geodesicRHS_KS(pos + 0.5*h*k2p, mom + 0.5*h*k2m, M, a, a2, k3p, k3m);
+    vec4 k4p, k4m; geodesicRHS_KS(pos + h*k3p,     mom + h*k3m,     M, a, a2, k4p, k4m);
+
+    pos += (h / 6.0) * (k1p + 2.0*k2p + 2.0*k3p + k4p);
+    mom += (h / 6.0) * (k1m + 2.0*k2m + 2.0*k3m + k4m);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 守恒量自检 —— 验证 Christoffel 是否正确
+// ══════════════════════════════════════════════════════════════
+//
+// 静态轴对称时空有两个守恒量（沿测地线不变）：
+//   能量    E = −p_t = −g_0ν p^ν
+//   角动量  L_z = p_φ = (绕 z 轴) = x p_y − y p_x  的协变版
+//                = g_2ν p^ν · (∂/∂φ 投影)...
+//
+// 简化做法：直接用协变动量 p_t 和绕轴角动量。
+//   p_t   = g_tν p^ν          （应守恒 → 能量）
+//   L_z   = g_φν p^ν，其中 ∂_φ = x ∂_y − y ∂_x
+//         → L_z = x·(g_2ν p^ν) − y·(g_1ν p^ν)
+//
+// 沿测地线积分若干步，比较起点/终点的 E 和 L_z，
+// 漂移越小说明 Christoffel 越准。把漂移映射成颜色：
+//   全黑 = 守恒（正确），发亮 = 不守恒（Christoffel 有错）。
+// ══════════════════════════════════════════════════════════════
+
+float covariant_pt(vec3 p, vec4 mom, float M, float a, float a2) {
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+    // p_t = g_0ν p^ν
+    float pt = 0.0;
+    for (int nu = 0; nu < 4; nu++) pt += metric_dn(0, nu, f, l) * mom[nu];
+    return pt;
+}
+
+float angularMomentum_z(vec3 p, vec4 mom, float M, float a, float a2) {
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+    // p_x = g_1ν p^ν, p_y = g_2ν p^ν
+    float px = 0.0, py = 0.0;
+    for (int nu = 0; nu < 4; nu++) {
+        px += metric_dn(1, nu, f, l) * mom[nu];
+        py += metric_dn(2, nu, f, l) * mom[nu];
+    }
+    // L_z = x p_y − y p_x
+    return p.x * py - p.y * px;
+}
+
+void main() {
+    ivec2 pix  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outImage);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    float M  = spacetime.bhParams.x;
+    float a  = spacetime.bhParams.y;
+    float a2 = a * a;
+
+    vec3 camPos = vec3(30.0, 0.0, 3.0);
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec4 wd4 = cam.invViewProj * vec4(uv, 1.0, 1.0);
+    vec3 dir = normalize(wd4.xyz / wd4.w - camPos);
+
+    // 构造初始光子动量（笛卡尔下直接用 dir 作空间动量）
+    // 类光条件 g_μν p^μ p^ν = 0 解 p^t（下一块会规范化，这里够验证守恒）
+    float f; vec4 l;
+    kerrSchildScalars(camPos, M, a, a2, f, l);
+
+    // 空间动量 = dir，解 p^t 使总和为 null
+    // g_tt (p^t)² + 2 g_ti p^t p^i + g_ij p^i p^j = 0
+    float g_tt = metric_dn(0, 0, f, l);
+    float B = 0.0, C = 0.0;
+    vec3 pe = dir;
+    for (int i = 1; i < 4; i++) {
+        B += 2.0 * metric_dn(0, i, f, l) * pe[i-1];
+        for (int j = 1; j < 4; j++) {
+            C += metric_dn(i, j, f, l) * pe[i-1] * pe[j-1];
+        }
+    }
+    float disc = max(B*B - 4.0*g_tt*C, 0.0);
+    float pt = (-B - sqrt(disc)) / (2.0 * g_tt);  // 取一个根
+    if (pt < 0.0) pt = (-B + sqrt(disc)) / (2.0 * g_tt);
+
+    vec4 pos = vec4(0.0, camPos);
+    vec4 mom = vec4(pt, dir);
+
+    // 记录初始守恒量
+    float E0 = covariant_pt(camPos, mom, M, a, a2);
+    float L0 = angularMomentum_z(camPos, mom, M, a, a2);
+
+    // 积分 60 步（不终止，纯测守恒）
+    float h = 0.2;
+    for (int i = 0; i < 60; i++) {
+        // 远离黑洞或落入内部就停
+        float rr = kerrRadius(pos.yzw, a2);
+        if (rr < 1.5 || length(pos.yzw) > 50.0) break;
+        rk4Step_KS(pos, mom, h, M, a, a2);
+    }
+
+    // 终点守恒量
+    float E1 = covariant_pt(pos.yzw, mom, M, a, a2);
+    float L1 = angularMomentum_z(pos.yzw, mom, M, a, a2);
+
+    // 相对漂移
+    float dE = abs(E1 - E0) / max(abs(E0), 1e-6);
+    float dL = abs(L1 - L0) / max(abs(L0), 1e-6);
+    float drift = max(dE, dL);
+
+    // 全黑 = 守恒（Christoffel 正确）；发亮 = 有错
+    // 放大便于看清；正常应整屏接近黑（边缘强偏折区可能微亮）
+    float v = clamp(drift * 50.0, 0.0, 1.0);
+    imageStore(outImage, pix, vec4(v, v * 0.5, 0.0, 1.0));
+}

@@ -1,26 +1,33 @@
-# 着色器编译
+# 着色器编译 — 自动发现 shaders/ 下所有 .comp .vert .frag
 set(SHADER_SRC_DIR "${CMAKE_SOURCE_DIR}/shaders")
 set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/src/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
 
-function(compile_shader SHADER_FILE)
-    add_custom_command(
-        OUTPUT "${SHADER_OUT_DIR}/${SHADER_FILE}.spv"
-        COMMAND glslc "${SHADER_SRC_DIR}/${SHADER_FILE}" -o "${SHADER_OUT_DIR}/${SHADER_FILE}.spv"
-        DEPENDS "${SHADER_SRC_DIR}/${SHADER_FILE}"
-        COMMENT "Compiling ${SHADER_FILE} → SPIR-V"
-    )
-endfunction()
-
-compile_shader(geodesic.comp)
-compile_shader(fullscreen.vert)
-compile_shader(fullscreen.frag)
-
-set(SHADER_SPV
-    "${SHADER_OUT_DIR}/geodesic.comp.spv"
-    "${SHADER_OUT_DIR}/fullscreen.vert.spv"
-    "${SHADER_OUT_DIR}/fullscreen.frag.spv"
+file(GLOB SHADER_SRCS CONFIGURE_DEPENDS
+    "${SHADER_SRC_DIR}/*.comp"
+    "${SHADER_SRC_DIR}/*.vert"
+    "${SHADER_SRC_DIR}/*.frag"
 )
+
+# 排除 ks_block_* 系列（旧实验文件）
+list(FILTER SHADER_SRCS EXCLUDE REGEX "ks_block")
+list(FILTER SHADER_SRCS EXCLUDE REGEX "\\.old$")
+
+set(SHADER_SPV "")
+
+foreach(SHADER_SRC ${SHADER_SRCS})
+    get_filename_component(SHADER_NAME ${SHADER_SRC} NAME)
+    set(SPV_OUT "${SHADER_OUT_DIR}/${SHADER_NAME}.spv")
+    add_custom_command(
+        OUTPUT "${SPV_OUT}"
+        COMMAND glslc "${SHADER_SRC}" -o "${SPV_OUT}"
+        DEPENDS "${SHADER_SRC}"
+        COMMENT "Compiling ${SHADER_NAME} → SPIR-V"
+    )
+    list(APPEND SHADER_SPV "${SPV_OUT}")
+endforeach()
+
+message(STATUS "Shader sources: ${SHADER_SRCS}")
 
 add_executable(simulation main.cpp
         vulkan/vulkan_app.cpp

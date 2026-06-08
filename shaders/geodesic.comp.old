@@ -1,0 +1,702 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// ── UBO: 相机参数 (std140, 96B) ──
+// offset 0:  vec4 camPos (t, r, θ, φ in BL coords + pad)
+// offset 16: mat4 invViewProj
+// offset 80: float stepSize
+// offset 84: int   maxSteps
+// offset 88: float escapeRadius
+// offset 92: float pad
+layout(set = 0, binding = 0) uniform CameraUBO {
+    vec4  camPos;
+    mat4  invViewProj;
+    float stepSize;
+    int   maxSteps;
+    float escapeRadius;
+    float pad0;
+} cam;
+
+// ── UBO: 时空参数 (std140, 48B) ──
+// offset 0:  vec4 bhParams (M, a, horizon_radius, inner_horizon_radius)
+// offset 16: vec4 integratorParams (tolerance, minStep, maxStep, safety)
+// offset 32: vec4 diskParams (inner_r, outer_r, height, pad)
+layout(set = 0, binding = 1) uniform SpacetimeUBO {
+    vec4 bhParams;
+    vec4 integratorParams;
+    vec4 diskParams;
+} spacetime;
+
+// ── 输出 ──
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D outImage;
+
+// ══════════════════════════════════════════════════════════════
+// Kerr 度规辅助函数
+// ══════════════════════════════════════════════════════════════
+
+float Sigma(float r, float ct, float a2) {
+    return r * r + a2 * ct * ct;
+}
+
+float Delta(float r, float M, float a2) {
+    return r * r - 2.0 * M * r + a2;
+}
+
+// ══════════════════════════════════════════════════════════════
+// 协变度规 g_μν — Boyer-Lindquist 坐标
+// 非零分量: g_tt, g_tφ, g_rr, g_θθ, g_φφ (及对称)
+// ══════════════════════════════════════════════════════════════
+
+float g_dn(int mu, int nu, vec4 pos, float M, float a, float a2) {
+    float r     = pos.y;
+    float theta = pos.z;
+    float st    = sin(theta);
+    float st2   = st * st;
+    float S     = Sigma(r, cos(theta), a2);
+
+    // g_tt
+    if (mu == 0 && nu == 0) {
+        return -(1.0 - 2.0 * M * r / S);
+    }
+    // g_tφ = g_φt
+    if ((mu == 0 && nu == 3) || (mu == 3 && nu == 0)) {
+        return -2.0 * M * a * r * st2 / S;
+    }
+    // g_rr
+    if (mu == 1 && nu == 1) {
+        return S / Delta(r, M, a2);
+    }
+    // g_θθ
+    if (mu == 2 && nu == 2) {
+        return S;
+    }
+    // g_φφ
+    if (mu == 3 && nu == 3) {
+        float r2 = r * r;
+        return (r2 + a2 + 2.0 * M * a2 * r * st2 / S) * st2;
+    }
+    return 0.0;
+}
+
+// ══════════════════════════════════════════════════════════════
+// 逆变度规 g^μν
+// ══════════════════════════════════════════════════════════════
+
+float g_up(int mu, int nu, vec4 pos, float M, float a, float a2) {
+    float r     = pos.y;
+    float theta = pos.z;
+    float st    = sin(theta);
+    float st2   = st * st;
+    float S     = Sigma(r, cos(theta), a2);
+    float D     = Delta(r, M, a2);
+    float r2    = r * r;
+
+    // g^tt
+    if (mu == 0 && nu == 0) {
+        float A = (r2 + a2) * (r2 + a2) - a2 * D * st2;
+        return -A / (S * D);
+    }
+    // g^tφ = g^φt
+    if ((mu == 0 && nu == 3) || (mu == 3 && nu == 0)) {
+        return -2.0 * M * a * r / (S * D);
+    }
+    // g^rr
+    if (mu == 1 && nu == 1) {
+        return D / S;
+    }
+    // g^θθ
+    if (mu == 2 && nu == 2) {
+        return 1.0 / S;
+    }
+    // g^φφ
+    if (mu == 3 && nu == 3) {
+        if (st2 < 1e-30) return 0.0;
+        float A = (r2 + a2) * (r2 + a2) - a2 * D * st2;
+        return (D - a2 * st2) / (S * D * st2);
+    }
+    return 0.0;
+}
+
+// ══════════════════════════════════════════════════════════════
+// Christoffel 符号 Γ^μ_αβ — 解析式（翻译自 kerr.h）
+// 对称性: Γ^μ_αβ = Γ^μ_βα，调用前保证 alpha ≤ beta
+// ══════════════════════════════════════════════════════════════
+
+float christoffel(int mu, int alpha, int beta,
+                  vec4 pos, float M, float a, float a2) {
+    float r     = pos.y;
+    float theta = pos.z;
+    float st    = sin(theta);
+    float ct    = cos(theta);
+    float st2   = st * st;
+    float ct2   = ct * ct;
+    float S     = Sigma(r, ct, a2);
+    float D     = Delta(r, M, a2);
+    float r2    = r * r;
+
+    float dS_dr     = 2.0 * r;
+    float dS_dtheta = -2.0 * a2 * st * ct;
+    float dD_dr     = 2.0 * (r - M);
+
+    // ── Γ^t_αβ (mu == 0) ──
+    if (mu == 0) {
+        // Γ^t_tr
+        if ((alpha == 0 && beta == 1) || (alpha == 1 && beta == 0)) {
+            float num = (r2 + a2) * dS_dr - 2.0 * r * S;
+            return ((r2 + a2) * num) / (2.0 * S * S * D);
+        }
+        // Γ^t_tθ
+        if ((alpha == 0 && beta == 2) || (alpha == 2 && beta == 0)) {
+            return -a2 * M * r * st * ct * 2.0 / (S * S);
+        }
+        // Γ^t_rφ  (alpha=1, beta=3)
+        if (alpha == 1 && beta == 3) {
+            // 简化: -a M sin²θ (a² cos²θ (S - 2r²) + r² S) / (S² Δ)
+            float num = -a * M * st2 *
+                (a2 * ct2 * (S - 2.0 * r2) + r2 * S);
+            return num / (S * S * D);
+        }
+        // Γ^t_θφ (alpha=2, beta=3)
+        if (alpha == 2 && beta == 3) {
+            float num = -2.0 * a * M * r * (r2 + a2) * st * ct;
+            return num / (S * S * D) * st2;
+        }
+    }
+
+    // ── Γ^r_αβ (mu == 1) ──
+    if (mu == 1) {
+        // Γ^r_tt
+        if (alpha == 0 && beta == 0) {
+            return -M * D * (S - 2.0 * r2) / (S * S * S);
+        }
+        // Γ^r_tφ (alpha=0, beta=3)
+        if (alpha == 0 && beta == 3) {
+            return M * a * st2 * D * (S - 2.0 * r2) / (S * S * S);
+        }
+        // Γ^r_rr
+        if (alpha == 1 && beta == 1) {
+            return (dS_dr * D - S * dD_dr) / (2.0 * S * D);
+        }
+        // Γ^r_rθ (alpha=1, beta=2)
+        if (alpha == 1 && beta == 2) {
+            return -a2 * st * ct / S;
+        }
+        // Γ^r_θθ
+        if (alpha == 2 && beta == 2) {
+            return -r * D / S;
+        }
+        // Γ^r_φφ
+        if (alpha == 3 && beta == 3) {
+            float term = -st2 * D *
+                (r * S * S + M * a2 * st2 * (S - 2.0 * r2));
+            return term / (S * S * S);
+        }
+    }
+
+    // ── Γ^θ_αβ (mu == 2) ──
+    if (mu == 2) {
+        // Γ^θ_tt
+        if (alpha == 0 && beta == 0) {
+            return -2.0 * a2 * M * r * st * ct / (S * S * S);
+        }
+        // Γ^θ_tφ (alpha=0, beta=3)
+        if (alpha == 0 && beta == 3) {
+            return 2.0 * a * M * r * (r2 + a2) * st * ct / (S * S * S);
+        }
+        // Γ^θ_rθ (alpha=1, beta=2)
+        if (alpha == 1 && beta == 2) {
+            return r / S;
+        }
+        // Γ^θ_θθ
+        if (alpha == 2 && beta == 2) {
+            return dS_dtheta / (2.0 * S);
+        }
+        // Γ^θ_φφ
+        if (alpha == 3 && beta == 3) {
+            float term = -st * ct *
+                ((r2 + a2) * S * S + 2.0 * M * a2 * r * st2 * (S + r2 + a2))
+                / (S * S * S);
+            return term;
+        }
+    }
+
+    // ── Γ^φ_αβ (mu == 3) ──
+    if (mu == 3) {
+        // Γ^φ_tr (alpha=0, beta=1)
+        if (alpha == 0 && beta == 1) {
+            return -a * M * (S - 2.0 * r2) / (S * S * D);
+        }
+        // Γ^φ_tθ (alpha=0, beta=2)
+        if (alpha == 0 && beta == 2) {
+            if (abs(st) < 1e-15) return 0.0;
+            return -2.0 * a * M * r * ct / (S * S * st);
+        }
+        // Γ^φ_rφ (alpha=1, beta=3)
+        if (alpha == 1 && beta == 3) {
+            float num = S * (r * S - M * (r2 - a2 * ct2))
+                + r * (r2 + a2) * dS_dr;
+            return num / (2.0 * S * S * D);
+        }
+        // Γ^φ_θφ (alpha=2, beta=3)
+        if (alpha == 2 && beta == 3) {
+            if (abs(st) < 1e-15) return 0.0;
+            return ct / st + a2 * M * r * st * ct * 2.0 / (S * S);
+        }
+    }
+
+    return 0.0;
+}
+
+// ══════════════════════════════════════════════════════════════
+// Christoffel 包装 — 处理对称性
+// ══════════════════════════════════════════════════════════════
+
+float christoffel_sym(int mu, int alpha, int beta,
+                      vec4 pos, float M, float a, float a2) {
+    if (alpha > beta) { int tmp = alpha; alpha = beta; beta = tmp; }
+    return christoffel(mu, alpha, beta, pos, M, a, a2);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 测地线方程右端 — 手写展开版
+// 直接硬编码 Kerr 时空的 ~20 个非零 Christoffel 分量，
+// 避免通用三重循环 (64 次 function call/RHS) 的 GPU 寄存器压力。
+// dx^μ/dλ = p^μ
+// dp^μ/dλ = -Γ^μ_αβ p^α p^β
+// ══════════════════════════════════════════════════════════════
+
+void geodesicRHS(vec4 pos, vec4 mom, float M, float a, float a2,
+                 out vec4 dPos, out vec4 dMom) {
+    dPos = mom;
+
+    float r     = pos.y;
+    float theta = pos.z;
+    float st    = sin(theta);
+    float ct    = cos(theta);
+    float st2   = st * st;
+    float ct2   = ct * ct;
+    float S     = r * r + a2 * ct2;       // Sigma
+    float D     = r * r - 2.0 * M * r + a2; // Delta
+    float r2    = r * r;
+
+    float dS_dr     = 2.0 * r;
+    float dS_dtheta = -2.0 * a2 * st * ct;
+    float dD_dr     = 2.0 * (r - M);
+
+    float S2 = S * S;
+    float S3 = S * S2;
+    float r2pa2 = r2 + a2;
+
+    float pt  = mom.x;
+    float pr  = mom.y;
+    float pth = mom.z;
+    float pph = mom.w;
+
+    // ── Γ^t_αβ 贡献 (mu=0) ──
+    float Gt = 0.0;
+
+    // Γ^t_tr = Γ^t_rt: ((r²+a²)((r²+a²)dS_dr - 2rS)) / (2 S² Δ)
+    float G_t_tr = ((r2pa2) * (r2pa2 * dS_dr - 2.0 * r * S)) / (2.0 * S2 * D);
+    Gt += 2.0 * G_t_tr * pt * pr;
+
+    // Γ^t_tθ = Γ^t_θt: -2 a² M r sinθ cosθ / S²
+    float G_t_ttheta = -a2 * M * r * st * ct * 2.0 / S2;
+    Gt += 2.0 * G_t_ttheta * pt * pth;
+
+    // Γ^t_rφ = Γ^t_φr: -a M sin²θ (a² cos²θ (S - 2r²) + r² S) / (S² Δ)
+    float G_t_rphi = -a * M * st2 * (a2 * ct2 * (S - 2.0 * r2) + r2 * S) / (S2 * D);
+    Gt += 2.0 * G_t_rphi * pr * pph;
+
+    // Γ^t_θφ = Γ^t_φθ: -2 a M r (r²+a²) sinθ cosθ sin²θ / (S² Δ)
+    float G_t_theta_phi_num = -2.0 * a * M * r * r2pa2 * st * ct;
+    float G_t_theta_phi = G_t_theta_phi_num * st2 / (S2 * D);
+    Gt += 2.0 * G_t_theta_phi * pth * pph;
+
+    // ── Γ^r_αβ 贡献 (mu=1) ──
+    float Gr = 0.0;
+
+    // Γ^r_tt: -M Δ (Σ - 2r²) / Σ³
+    Gr += (-M * D * (S - 2.0 * r2) / S3) * pt * pt;
+
+    // Γ^r_tφ = Γ^r_φt: M a sin²θ Δ (Σ - 2r²) / Σ³
+    float G_r_tphi = M * a * st2 * D * (S - 2.0 * r2) / S3;
+    Gr += 2.0 * G_r_tphi * pt * pph;
+
+    // Γ^r_rr: (dS_dr Δ - Σ dD_dr) / (2 Σ Δ)
+    Gr += ((dS_dr * D - S * dD_dr) / (2.0 * S * D)) * pr * pr;
+
+    // Γ^r_rθ = Γ^r_θr: -a² sinθ cosθ / Σ
+    Gr += 2.0 * (-a2 * st * ct / S) * pr * pth;
+
+    // Γ^r_θθ: -r Δ / Σ
+    Gr += (-r * D / S) * pth * pth;
+
+    // Γ^r_φφ: -sin²θ Δ [r Σ² + M a² sin²θ (Σ - 2r²)] / Σ³
+    Gr += (-st2 * D * (r * S2 + M * a2 * st2 * (S - 2.0 * r2)) / S3) * pph * pph;
+
+    // ── Γ^θ_αβ 贡献 (mu=2) ──
+    float Gth = 0.0;
+
+    // Γ^θ_tt: -2 a² M r sinθ cosθ / Σ³
+    Gth += (-2.0 * a2 * M * r * st * ct / S3) * pt * pt;
+
+    // Γ^θ_tφ = Γ^θ_φt: 2 a M r (r²+a²) sinθ cosθ / Σ³
+    Gth += 2.0 * (2.0 * a * M * r * r2pa2 * st * ct / S3) * pt * pph;
+
+    // Γ^θ_rθ = Γ^θ_θr: r / Σ
+    Gth += 2.0 * (r / S) * pr * pth;
+
+    // Γ^θ_θθ: dS_dθ / (2 Σ)
+    Gth += (dS_dtheta / (2.0 * S)) * pth * pth;
+
+    // Γ^θ_φφ: -sinθ cosθ [(r²+a²)Σ² + 2 M a² r sin²θ (Σ + r² + a²)] / Σ³
+    float term_th_pp = r2pa2 * S2 + 2.0 * M * a2 * r * st2 * (S + r2pa2);
+    Gth += (-st * ct * term_th_pp / S3) * pph * pph;
+
+    // ── Γ^φ_αβ 贡献 (mu=3) ──
+    float Gph = 0.0;
+
+    // Γ^φ_tr = Γ^φ_rt: -a M (Σ - 2r²) / (Σ² Δ)
+    float G_phi_tr = -a * M * (S - 2.0 * r2) / (S2 * D);
+    Gph += 2.0 * G_phi_tr * pt * pr;
+
+    // Γ^φ_tθ = Γ^φ_θt: -2 a M r cotθ / Σ²  (注意 sinθ→0 发散)
+    if (abs(st) > 1e-10) {
+        Gph += 2.0 * (-2.0 * a * M * r * ct / (S2 * st)) * pt * pth;
+    }
+
+    // Γ^φ_rφ = Γ^φ_φr: [Σ(rΣ - M(r² - a² cos²θ)) + r(r²+a²)dS_dr] / (2 Σ² Δ)
+    float G_phi_rphi = (S * (r * S - M * (r2 - a2 * ct2)) + r * r2pa2 * dS_dr) / (2.0 * S2 * D);
+    Gph += 2.0 * G_phi_rphi * pr * pph;
+
+    // Γ^φ_θφ = Γ^φ_φθ: cotθ + 2 a² M r sinθ cosθ / Σ²
+    if (abs(st) > 1e-10) {
+        float G_phi_thphi = ct / st + a2 * M * r * st * ct * 2.0 / S2;
+        Gph += 2.0 * G_phi_thphi * pth * pph;
+    }
+
+    dMom = vec4(-Gt, -Gr, -Gth, -Gph);
+}
+
+// ══════════════════════════════════════════════════════════════
+// RK4 单步 — 固定步长
+// ══════════════════════════════════════════════════════════════
+
+void rk4Step(inout vec4 pos, inout vec4 mom, float h,
+             float M, float a, float a2) {
+    vec4 k1p, k1m;
+    geodesicRHS(pos, mom, M, a, a2, k1p, k1m);
+
+    vec4 p2 = pos + 0.5 * h * k1p;
+    vec4 m2 = mom + 0.5 * h * k1m;
+    vec4 k2p, k2m;
+    geodesicRHS(p2, m2, M, a, a2, k2p, k2m);
+
+    vec4 p3 = pos + 0.5 * h * k2p;
+    vec4 m3 = mom + 0.5 * h * k2m;
+    vec4 k3p, k3m;
+    geodesicRHS(p3, m3, M, a, a2, k3p, k3m);
+
+    vec4 p4 = pos + h * k3p;
+    vec4 m4 = mom + h * k3m;
+    vec4 k4p, k4m;
+    geodesicRHS(p4, m4, M, a, a2, k4p, k4m);
+
+    pos += (h / 6.0) * (k1p + 2.0 * k2p + 2.0 * k3p + k4p);
+    mom += (h / 6.0) * (k1m + 2.0 * k2m + 2.0 * k3m + k4m);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 自适应步长 RK4: 一步全步 + 两步半步 → 误差估计 → 步长调整
+// Richardson extrapolation / step doubling
+// ══════════════════════════════════════════════════════════════
+
+void rk4AdaptiveStep(inout vec4 pos, inout vec4 mom, inout float h,
+                     float M, float a, float a2,
+                     float tol, float minH, float maxH, float safety) {
+    // 全步
+    vec4 posFull = pos;
+    vec4 momFull = mom;
+    rk4Step(posFull, momFull, h, M, a, a2);
+
+    // 两个半步
+    vec4 posHalf = pos;
+    vec4 momHalf = mom;
+    float h2 = 0.5 * h;
+    rk4Step(posHalf, momHalf, h2, M, a, a2);
+    rk4Step(posHalf, momHalf, h2, M, a, a2);
+
+    // 误差估计 (L2 norm over 8D phase space)
+    vec4 dPos = posFull - posHalf;
+    vec4 dMom = momFull - momHalf;
+    float err = length(dPos) + length(dMom);
+
+    // PI 步长控制器
+    float newH = h;
+    if (err > 0.0) {
+        // RK4 是 4 阶 → 半步误差约为全步误差 / 15
+        // 缩放因子: (tol / (err/15))^(1/5) = (15*tol/err)^(1/5)
+        newH = safety * h * pow(15.0 * tol / max(err, 1e-30), 0.2);
+    } else {
+        newH = 2.0 * h;
+    }
+    newH = clamp(newH, minH, maxH);
+
+    // 接受/拒绝
+    if (err < 15.0 * tol) {
+        // 接受: 使用更高阶的半步结果的线性组合
+        // 5 阶外推: pos_5th ≈ (16 * posHalf - posFull) / 15
+        pos = (16.0 * posHalf - posFull) / 15.0;
+        mom = (16.0 * momHalf - momFull) / 15.0;
+    } else {
+        // 拒绝: 用半步结果（比全步更精确），但保留原 pos/mom 重试
+        pos = posHalf;
+        mom = momHalf;
+    }
+    h = newH;
+}
+
+// ══════════════════════════════════════════════════════════════
+// 终止判定
+// ══════════════════════════════════════════════════════════════
+
+struct TermReason {
+    int code; // 0=continue, 1=capture, 2=escape, 3=disk, 4=maxSteps
+};
+
+TermReason checkTermination(vec4 pos, float horizonR, float escapeR,
+                            float diskInner, float diskOuter, float diskH) {
+    float r = pos.y;
+    float theta = pos.z;
+
+    // 落入视界
+    if (r < horizonR * 1.005) {
+        TermReason t;
+        t.code = 1;
+        return t;
+    }
+
+    // 逃逸
+    if (r > escapeR) {
+        TermReason t;
+        t.code = 2;
+        return t;
+    }
+
+    // 命中吸积盘 (赤道面 ± diskH)
+    if (r >= diskInner && r <= diskOuter) {
+        float dTheta = abs(theta - 1.57079632679); // π/2
+        if (dTheta < diskH) {
+            TermReason t;
+            t.code = 3;
+            return t;
+        }
+    }
+
+    TermReason t;
+    t.code = 0;
+    return t;
+}
+
+// ══════════════════════════════════════════════════════════════
+// 背景天空采样
+// ══════════════════════════════════════════════════════════════
+
+vec3 sampleBackground(vec3 dir) {
+    vec3 d = normalize(dir);
+
+    // 银河盘面
+    float galaxy = exp(-abs(d.y) * 6.0) * 0.12;
+    vec3 bg = vec3(galaxy * 0.3, galaxy * 0.4, galaxy * 0.7);
+
+    // 星点
+    vec3 sd = floor(d * 250.0);
+    float h = fract(sin(dot(sd, vec3(127.1, 311.7, 74.3))) * 43758.5453);
+    float star = step(0.9975, h);
+    float brightness = fract(h * 83.27);
+    bg += vec3(0.7, 0.8, 1.0) * star * (0.3 + 0.7 * brightness);
+
+    // 黑洞附近的红移/蓝移暗示（远场用）
+    return bg;
+}
+
+// ══════════════════════════════════════════════════════════════
+// BL 坐标 → 伪笛卡尔 (用于可视化)
+// ══════════════════════════════════════════════════════════════
+
+vec3 blToCartesian(vec4 pos) {
+    float r     = pos.y;
+    float theta = pos.z;
+    float phi   = pos.w;
+    float st = sin(theta);
+    return vec3(r * st * cos(phi), r * st * sin(phi), r * cos(theta));
+}
+
+// ══════════════════════════════════════════════════════════════
+// 主追踪循环
+// ══════════════════════════════════════════════════════════════
+
+vec4 tracePhoton(vec4 startPos, vec4 startMom,
+                 float M, float a, float a2,
+                 float horizonR, float innerR,
+                 float escapeR, float diskInner, float diskOuter, float diskH,
+                 float h, int maxSteps) {
+    vec4 pos = startPos;
+    vec4 mom = startMom;
+
+    for (int i = 0; i < maxSteps; i++) {
+        TermReason term = checkTermination(pos, horizonR, escapeR,
+                                           diskInner, diskOuter, diskH);
+
+        if (term.code == 1) {
+            // 捕获 — 纯黑
+            return vec4(0.0, 0.0, 0.0, 1.0);
+        }
+        if (term.code == 2) {
+            // 逃逸 — 采样天空
+            vec3 dir = normalize(blToCartesian(pos) - blToCartesian(startPos));
+            return vec4(sampleBackground(dir), 1.0);
+        }
+        if (term.code == 3) {
+            // 吸积盘命中 — 暖色 (内盘蓝白→外盘橙红)
+            float r = pos.y;
+            float t = (r - diskInner) / max(diskOuter - diskInner, 0.01);
+            t = clamp(t, 0.0, 1.0);
+            vec3 innerColor = vec3(0.6, 0.8, 1.0);
+            vec3 outerColor = vec3(1.0, 0.5, 0.2);
+            float brightness = 0.5 + 0.5 * (1.0 - t);
+            return vec4(brightness * mix(innerColor, outerColor, t), 1.0);
+        }
+
+        // 固定步长 RK4 — 步长幂律缩放
+        // 靠近视界时步长自动缩小，远场急剧放大，保证能探测薄盘面
+        float ratio = max(pos.y / horizonR, 1.0);
+        float scale = clamp(pow(ratio, 0.65), 0.02, 15.0);
+        float eh = h * scale;
+        rk4Step(pos, mom, eh, M, a, a2);
+
+        // 方向感知提前终止: 远场 + 径向动量向外 → 直接逃逸
+        if (pos.y > 20.0 * M && mom.y > 0.0) {
+            vec3 dir = normalize(blToCartesian(pos) - blToCartesian(startPos));
+            return vec4(sampleBackground(dir), 1.0);
+        }
+    }
+
+    // 超出最大步数 — 暗灰色
+    return vec4(0.05, 0.05, 0.08, 1.0);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 主入口
+// ══════════════════════════════════════════════════════════════
+
+void main() {
+    ivec2 pix  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outImage);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    // ── 参数解包 ──
+    float M         = spacetime.bhParams.x;
+    float a         = spacetime.bhParams.y;
+    float horizonR  = spacetime.bhParams.z;
+    float innerR    = spacetime.bhParams.w;
+    float tol       = spacetime.integratorParams.x;
+    float minH      = spacetime.integratorParams.y;
+    float maxH      = spacetime.integratorParams.z;
+    float safety    = spacetime.integratorParams.w;
+    float diskInner = spacetime.diskParams.x;
+    float diskOuter = spacetime.diskParams.y;
+    float diskH     = spacetime.diskParams.z;
+
+    float a2 = a * a;
+
+    // ── 初始光线生成 ──
+    // 相机在 BL 坐标中的位置
+    vec4 startPos = cam.camPos;
+    // 确保 startPos.w (φ) 在有效范围
+    startPos.w = mod(startPos.w, 6.28318530718);
+
+    // NDC → 世界空间射线方向
+    // 相机在伪笛卡尔世界坐标中的位置 (黑洞在原点，自转轴沿 +z)
+    vec3 camCartesian = blToCartesian(startPos);
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec4 worldDir4 = cam.invViewProj * vec4(uv, 1.0, 1.0);
+    vec3 worldDir  = normalize(worldDir4.xyz / worldDir4.w - camCartesian);
+
+    // 将 3D 笛卡尔方向转换为 BL 坐标系中的动量分量
+    // 在远场近似下，BL (r,θ,φ) ≈ 球坐标
+    // 相机位置: (r0, θ0, φ0)
+    float r0   = startPos.y;
+    float th0  = startPos.z;
+    float ph0  = startPos.w;
+    float st0  = sin(th0);
+    float ct0  = cos(th0);
+
+    // 构造局部基向量 (在相机位置的 BL 切空间中)
+    vec3 eR     = vec3(st0 * cos(ph0), st0 * sin(ph0), ct0);
+    vec3 eTheta = vec3(ct0 * cos(ph0), ct0 * sin(ph0), -st0);
+    vec3 ePhi   = vec3(-sin(ph0), cos(ph0), 0.0);
+
+    // 将 worldDir 投影到 BL 切空间
+    float pR     = dot(worldDir, eR);
+    float pTheta = dot(worldDir, eTheta) / max(r0, 0.01);
+    float pPhi   = dot(worldDir, ePhi) / max(r0 * st0, 0.001);
+
+    // 归一化空间分量 (让 |(pR, pTheta, pPhi)| ≈ 1)
+    float spatialNorm = sqrt(pR*pR + pTheta*pTheta + pPhi*pPhi);
+    if (spatialNorm < 1e-10) spatialNorm = 1.0;
+    pR     /= spatialNorm;
+    pTheta /= spatialNorm;
+    pPhi   /= spatialNorm;
+
+    // 从类光条件 g_μν p^μ p^ν = 0 解出 p^t
+    // A (p^t)² + B p^t + C = 0
+    float g_tt = g_dn(0, 0, startPos, M, a, a2);
+    float g_tp = g_dn(0, 3, startPos, M, a, a2);
+    float g_rr = g_dn(1, 1, startPos, M, a, a2);
+    float g_ttheta = g_dn(2, 2, startPos, M, a, a2);
+    float g_pp  = g_dn(3, 3, startPos, M, a, a2);
+
+    float Aq = g_tt;
+    float Bq = 2.0 * g_tp * pPhi;
+    float Cq = g_rr * pR * pR + g_ttheta * pTheta * pTheta + g_pp * pPhi * pPhi;
+
+    float disc = Bq * Bq - 4.0 * Aq * Cq;
+    if (disc < 0.0) disc = 0.0;
+    float sqrtDisc = sqrt(disc);
+
+    // 选正向时间解 (p^t > 0)
+    float pt1 = (-Bq + sqrtDisc) / (2.0 * Aq);
+    float pt2 = (-Bq - sqrtDisc) / (2.0 * Aq);
+    float pt = max(pt1, pt2);
+    if (pt <= 0.0) pt = pt1; // fallback
+
+    vec4 startMom = vec4(pt, pR, pTheta, pPhi);
+
+
+    // 远场平直时空近似，保守覆盖引力透镜偏折 (影响球半径 ≥ 10×视界)
+    float R_influence = max(horizonR * 10.0, 15.0);
+    {
+        vec3 O = camCartesian;
+        vec3 D = worldDir;
+        float b_sph = 2.0 * dot(O, D);
+        float c_sph = dot(O, O) - R_influence * R_influence;
+        float disc_sph = b_sph * b_sph - 4.0 * c_sph;
+        if (disc_sph < 0.0) {
+            imageStore(outImage, pix, vec4(sampleBackground(worldDir), 1.0));
+            return;
+        }
+    }
+
+    // ── 追踪 ──
+    float h = cam.stepSize;
+    vec4 color = tracePhoton(startPos, startMom,
+                             M, a, a2,
+                             horizonR, innerR,
+                             cam.escapeRadius,
+                             diskInner, diskOuter, diskH,
+                             h, cam.maxSteps);
+
+    imageStore(outImage, pix, color);
+}

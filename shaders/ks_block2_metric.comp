@@ -1,0 +1,134 @@
+// ══════════════════════════════════════════════════════════════
+// 第二块：Kerr-Schild 度规 g_μν 与逆度规 g^μν
+// ══════════════════════════════════════════════════════════════
+//
+// 坐标顺序：(t, x, y, z) = 指标 (0, 1, 2, 3)
+//
+// 核心结构（Kerr-Schild 形式）：
+//     g_μν = η_μν + f · l_μ · l_ν      （协变）
+//     g^μν = η^μν − f · l^μ · l^ν      （逆变，符号翻转）
+//
+// 其中：
+//     η_μν = diag(-1, +1, +1, +1)      闵可夫斯基
+//     f    = 2 M r³ / (r⁴ + a² z²)     标量
+//     l_μ  = (1, lx, ly, lz)           类光向量（协变，下指标）
+//          lx = (r x + a y) / (r² + a²)
+//          ly = (r y − a x) / (r² + a²)
+//          lz = z / r
+//
+// 关键性质：l 是 null（η^μν l_μ l_ν = 0），
+//          这保证了 g 和 g⁻¹ 互逆，且这个 f·l·l 修正项形式
+//          对协变/逆变只差一个符号 —— 不用解 4×4 矩阵求逆。
+//
+// 注意：l^μ（上指标）与 l_μ（下指标）的关系，
+//      因为 l 是 null 且 l_0 = 1：
+//          l^0 = η^00 l_0 = -1
+//          l^i = η^ii l_i = +l_i  (i = 1,2,3)
+//      即 l^μ = (-1, lx, ly, lz)，仅时间分量变号。
+// ══════════════════════════════════════════════════════════════
+
+// 一次性算好 f 和 l_μ（协变），避免重复计算
+// 返回：out_f = f，out_l = (l_0, l_1, l_2, l_3) = (1, lx, ly, lz)
+void kerrSchildScalars(vec3 p, float M, float a, float a2,
+                       out float out_f, out vec4 out_l) {
+    float r  = kerrRadius(p, a2);
+    float r2 = r * r;
+
+    float denom_l = r2 + a2;
+    // 防 r → 0（环奇点附近）时除零
+    float inv_denom_l = 1.0 / max(denom_l, 1e-12);
+
+    float lx = (r * p.x + a * p.y) * inv_denom_l;
+    float ly = (r * p.y - a * p.x) * inv_denom_l;
+    float lz = p.z / max(r, 1e-12);
+
+    out_l = vec4(1.0, lx, ly, lz);
+
+    float r4 = r2 * r2;
+    out_f = 2.0 * M * r2 * r / max(r4 + a2 * p.z * p.z, 1e-12);
+}
+
+// ── 协变度规分量 g_μν ──
+// η_μν = diag(-1,1,1,1)；g_μν = η_μν + f l_μ l_ν
+float metric_dn(int mu, int nu, float f, vec4 l) {
+    float eta = (mu == nu) ? (mu == 0 ? -1.0 : 1.0) : 0.0;
+    return eta + f * l[mu] * l[nu];
+}
+
+// ── 逆变度规分量 g^μν ──
+// η^μν = diag(-1,1,1,1)（闵可夫斯基逆 = 自身）
+// l^μ = (-1, lx, ly, lz)，仅时间分量变号
+// g^μν = η^μν − f l^μ l^ν
+float metric_up(int mu, int nu, float f, vec4 l) {
+    float eta = (mu == nu) ? (mu == 0 ? -1.0 : 1.0) : 0.0;
+    // 构造 l^μ：时间分量取负
+    float lup_mu = (mu == 0) ? -l[0] : l[mu];
+    float lup_nu = (nu == 0) ? -l[0] : l[nu];
+    return eta - f * lup_mu * lup_nu;
+}
+
+// ══════════════════════════════════════════════════════════════
+// 验证用：检查 g 与 g⁻¹ 是否真的互逆
+// ══════════════════════════════════════════════════════════════
+//
+// 对任意点，g_μα · g^αν 应当 = δ_μ^ν（单位矩阵）。
+// 逐像素算这个乘积，把"偏离单位矩阵的程度"映射成颜色：
+//   - 完全正确 → 全黑（误差 0）
+//   - 有错误   → 亮红（误差大）
+//
+// 把 main() 换成下面这个验证版。预期：整屏接近全黑
+// （只有环奇点 ρ ≈ a 附近可能因数值精度发亮，正常）。
+// ══════════════════════════════════════════════════════════════
+
+float metricInverseError(vec3 p, float M, float a, float a2) {
+    float f; vec4 l;
+    kerrSchildScalars(p, M, a, a2, f, l);
+
+    float maxErr = 0.0;
+    for (int mu = 0; mu < 4; mu++) {
+        for (int nu = 0; nu < 4; nu++) {
+            // (g · g⁻¹)_μ^ν = Σ_α g_μα g^αν
+            float sum = 0.0;
+            for (int alpha = 0; alpha < 4; alpha++) {
+                sum += metric_dn(mu, alpha, f, l) * metric_up(alpha, nu, f, l);
+            }
+            float expected = (mu == nu) ? 1.0 : 0.0;
+            maxErr = max(maxErr, abs(sum - expected));
+        }
+    }
+    return maxErr;
+}
+
+void main() {
+    ivec2 pix  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outImage);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    float M  = spacetime.bhParams.x;
+    float a  = spacetime.bhParams.y;
+    float a2 = a * a;
+
+    vec3 camPos = vec3(30.0, 0.0, 3.0);
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec4 wd4 = cam.invViewProj * vec4(uv, 1.0, 1.0);
+    vec3 dir = normalize(wd4.xyz / wd4.w - camPos);
+
+    // 沿视线取一个代表点（相机前方、黑洞附近）测试互逆性
+    // 用 minR 那段逻辑找最接近黑洞的点
+    vec3 p = camPos;
+    vec3 testP = camPos + dir * 30.0;  // 默认值
+    float minR = 1e30;
+    for (int i = 0; i < 200; i++) {
+        p += dir * 0.3;
+        float r = kerrRadius(p, a2);
+        if (r < minR) { minR = r; testP = p; }
+        if (length(p) > 60.0 && dot(p, dir) > 0.0) break;
+    }
+
+    float err = metricInverseError(testP, M, a, a2);
+
+    // 误差 → 颜色：黑=正确，红=有错。放大 100 倍便于看清微小误差
+    float e = clamp(err * 100.0, 0.0, 1.0);
+    imageStore(outImage, pix, vec4(e, 0.0, 0.0, 1.0));
+}

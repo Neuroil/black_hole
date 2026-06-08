@@ -190,7 +190,7 @@ public:
 - 构造时持有 `const VulkanContext*` ——析构时通过 `context_->device()` 获取 device，不再重复持有裸 `VkDevice`
 - 构造时通过 `VulkanContext::memory_properties()` 查询合适的内存类型，一步完成 buffer 创建 + 内存分配 + 绑定
 - 被 move 后的对象处于安全空状态（指针置 `nullptr`，handle 置 `VK_NULL_HANDLE`）
-- 本项目中的用途：`camera_ubo_`（CameraUBO）和 `spacetime_ubo_`（SpacetimeUBO）各一个，具名成员由 VulkanApp 持有
+- 本项目中的用途：`camera_ubo_`（CameraUBO, 96B: camPos + invViewProj + stepSize + maxSteps + escapeRadius）和 `spacetime_ubo_`（SpacetimeUBO, 48B: bhParams + integratorParams + diskParams）各一个，具名成员由 VulkanApp 持有
 
 > 不提供 `upload_from_host` —— staging upload 是上层编排职责，不属于 buffer RAII 容器。GPUBuffer 只提供 `map()` / `unmap()`（host-visible buffer），数据上传由 VulkanApp 或独立动词类编排
 
@@ -405,13 +405,38 @@ public:
 private:
     // ── 名词层：所有 GPU 资源 ──
     std::unique_ptr<VulkanContext>    context_;          // 持有 GLFWwindow（窗口所有权在此）
+    GLFWwindow* window_ = nullptr;                       // 上下文裸指针（注册输入回调、主循环判断关闭）
+
+    // ── FPV Camera 状态 ──
+    // 第一人称: position + yaw/pitch, 无 target 无轨道
+    struct FPCamera {
+        glm::vec3 position = {0.0f, 15.0f, 5.0f};
+        float yaw   = -1.5708f;   // 绕 +z 轴旋转 (rad), 初始朝向 -y (黑洞)
+        float pitch = -0.316f;    // 抬角 from xy-plane (rad), 初始略向下看
+        float fov   = 60.0f;      // 垂直视场角 (度)
+        float move_speed = 0.3f;
+        float look_sensitivity = 0.003f;
+    } camera_;
+
+    // 鼠标状态
+    bool looking_ = false;
+    double last_mouse_x_ = 0.0;
+    double last_mouse_y_ = 0.0;
+
+    // GLFW 回调 (static + glfwSetWindowUserPointer 回找 this)
+    static void key_callback(GLFWwindow* w, int key, int scancode, int action, int mods);
+    static void mouse_button_callback(GLFWwindow* w, int button, int action, int mods);
+    static void cursor_pos_callback(GLFWwindow* w, double xpos, double ypos);
+    static void scroll_callback(GLFWwindow* w, double xoffset, double yoffset);
 
     // UBO 具名成员，意图明确
-    std::unique_ptr<GPUBuffer>        camera_ubo_;       // CameraUBO（tetrad, 轨道参数）
-    std::unique_ptr<GPUBuffer>        spacetime_ubo_;    // SpacetimeUBO（M, a）
+    // CameraUBO (std140, 96B): vec4 camPos + mat4 invViewProj + float stepSize + int maxSteps + float escapeRadius + float pad
+    std::unique_ptr<GPUBuffer>        camera_ubo_;
+    // SpacetimeUBO (std140, 48B): vec4 bhParams + vec4 integratorParams + vec4 diskParams
+    std::unique_ptr<GPUBuffer>        spacetime_ubo_;
 
     std::unique_ptr<GPUImage>         storage_image_;    // Compute Write → Graphics Read 数据通道
-    std::unique_ptr<ComputePipeline>  compute_pipeline_; // geodesic.comp
+    std::unique_ptr<ComputePipeline>  compute_pipeline_; // geodesic_minimal.comp
     std::unique_ptr<GraphicsPipeline> graphics_pipeline_;// presentation pass → swapchain
 
     // 少数裸 handle（量太少，不值得单独包装类；VulkanApp 负责生命周期）
@@ -424,9 +449,12 @@ private:
     VkPipelineLayout      graphics_pipeline_layout_       = VK_NULL_HANDLE;
     VkSampler             storage_sampler_                = VK_NULL_HANDLE;
 
-    // 同步原语（triple-buffered：MAX_FRAMES_IN_FLIGHT = 3）
+    // 同步原语
+    // image_available: 每 in-flight frame 一个 (acquire 时消费，submit 后安全重用)
     VkSemaphore image_available_semaphores_[MAX_FRAMES_IN_FLIGHT];
-    VkSemaphore render_finished_semaphores_[MAX_FRAMES_IN_FLIGHT];
+    // render_finished: 每 swapchain image 一个 (present 可能异步持有，
+    //   按 image_index 索引避免旧 image 的 present 未完成时复用 semaphore)
+    std::vector<VkSemaphore> render_finished_semaphores_;
     VkFence     frame_fences_[MAX_FRAMES_IN_FLIGHT];
     std::vector<VkFence> images_in_flight_;   // 跟踪每个 swapchain image 的 in-flight fence
     uint32_t current_frame_ = 0;
@@ -588,17 +616,19 @@ void VulkanApp::step_frame() {
     cmd.end();
 
     // 提交与呈现
+    // render_finished 按 image_index 索引: 每个 swapchain image 有独立 semaphore，
+    // 避免 current_frame_ 回绕时 presentation engine 还持有旧 semaphore
     context_->submit(cmd.handle(),
                      image_available_semaphores_[current_frame_],
-                     render_finished_semaphores_[current_frame_],
+                     render_finished_semaphores_[image_index],
                      fence);
-    context_->present(image_index, render_finished_semaphores_[current_frame_]);
+    context_->present(image_index, render_finished_semaphores_[image_index]);
 
     current_frame_ = (current_frame_ + 1) % MAX_FRAMES_IN_FLIGHT;
 }
 ```
 
-> **同步模型**：triple-buffered (MAX_FRAMES_IN_FLIGHT = 3)。3 组 semaphore + fence 轮转——GPU 可连续处理最多 3 帧，CPU 在帧首等待当前 slot 的 fence 确保 GPU 完成。`images_in_flight_` 数组跟踪每个 swapchain image 的 in-flight fence，防止同时向同一 image 提交多帧。
+> **同步模型**：triple-buffered (MAX_FRAMES_IN_FLIGHT = 3)。3 组 `image_available` semaphore + fence 轮转——GPU 可连续处理最多 3 帧，CPU 在帧首等待当前 slot 的 fence 确保 GPU 完成。`images_in_flight_` 数组跟踪每个 swapchain image 的 in-flight fence，防止同时向同一 image 提交多帧。`render_finished_semaphores_` 按 swapchain image 索引（而非 in-flight frame 索引）——每个 swapchain image 有独立 semaphore，避免 current_frame_ 回绕时 presentation engine 还持有旧 image 的 semaphore 导致复用竞态。
 >
 > **注**：viewport 和 scissor 通过 `vkCmdSetViewport` / `vkCmdSetScissor` 直接在 CommandBuffer 上设置（不走 CommandBuffer 封装方法），因为它们的参数（float extent）已经超出纯 Vulkan 薄封装的范围。
 
@@ -608,18 +638,22 @@ void VulkanApp::step_frame() {
 
 ```
 VulkanApp ──owns──► VulkanContext (含 GLFWwindow)
-                 ├─ GPUBuffer: camera_ubo_    (CameraUBO)
-                 ├─ GPUBuffer: spacetime_ubo_ (SpacetimeUBO)
+                 ├─ GLFWwindow* (裸指针，由 VulkanContext 持有所有权)
+                 ├─ FPCamera camera_ (相机状态: position, yaw, pitch, fov)
+                 ├─ 鼠标状态 (looking_, last_mouse_x_, last_mouse_y_)
+                 ├─ GPUBuffer: camera_ubo_    (CameraUBO, 96 bytes)
+                 ├─ GPUBuffer: spacetime_ubo_ (SpacetimeUBO, 48 bytes)
                  ├─ GPUImage  (storage image — compute → graphics 数据通道)
                  ├─ VkSampler  (storage image 采样用)
-                 ├─ ComputePipeline
+                 ├─ ComputePipeline (geodesic_minimal.comp)
                  ├─ GraphicsPipeline
                  ├─ VkDescriptorPool (VulkanApp 自有，不同于 VulkanContext 内的共享 pool)
                  ├─ VkDescriptorSetLayout × 2 (raw)
                  ├─ VkDescriptorSet × 2 (raw)
                  ├─ VkPipelineLayout × 2 (raw)
-                 ├─ VkSemaphore × 6 (image_available × 3 + render_finished × 3, raw)
-                 └─ VkFence × 3 (frame_fences_, raw)
+                 ├─ VkSemaphore × 3 (image_available, 每 in-flight frame 一个)
+                 ├─ std::vector<VkSemaphore> render_finished_semaphores_ (每 swapchain image 一个)
+                 ├─ VkFence × 3 (frame_fences_, raw)
                  └─ std::vector<VkFence> images_in_flight_ (每 swapchain image 一个)
 
 CommandBuffer ── 临时对象，每帧从 VulkanContext command pool 分配，pool reset 时回收
@@ -629,17 +663,19 @@ CommandBuffer ── 临时对象，每帧从 VulkanContext command pool 分配�
 
 ```
  1. VulkanContext              ─── 底层硬件全部就绪（含 GLFW window、command pool × 3、descriptor pool、pipeline cache）
- 2. GPUBuffer: camera_ubo_    ─── CameraUBO（host-visible, 64 bytes）
- 3. GPUBuffer: spacetime_ubo_ ─── SpacetimeUBO（host-visible, 64 bytes）
- 4. GPUImage (storage)         ─── compute → graphics 数据通道（VK_FORMAT_R32G32B32A32_SFLOAT）
- 5. VkSampler                  ─── NEAREST, CLAMP_TO_EDGE（graphics pass 采样 storage image）
- 6. 创建 compute descriptor set layout（binding 0=CameraUBO, 1=SpacetimeUBO, 2=StorageImage）
- 7. 创建 graphics descriptor set layout（binding 0=CombinedImageSampler）
- 8. 创建 compute pipeline layout + graphics pipeline layout
- 9. ComputePipeline            ─── geodesic.comp.spv
-10. GraphicsPipeline           ─── fullscreen.vert.spv + fullscreen.frag.spv（Dynamic Rendering, 传 swapchain format）
-11. VkDescriptorPool (VulkanApp 自有) + 分配/更新 compute + graphics descriptor sets
-12. 创建 sync objects：3 组 semaphore × 2 + fence（VK_FENCE_CREATE_SIGNALED_BIT，首帧直接通过）+ images_in_flight_
+ 2. GLFW 输入回调注册           ─── key, mouse_button, cursor_pos, scroll（通过 glfwSetWindowUserPointer 回找 VulkanApp）
+ 3. GPUBuffer: camera_ubo_    ─── CameraUBO（host-visible, 96 bytes）
+ 4. GPUBuffer: spacetime_ubo_ ─── SpacetimeUBO（host-visible, 48 bytes）
+ 5. GPUImage (storage)         ─── compute → graphics 数据通道（VK_FORMAT_R32G32B32A32_SFLOAT）
+ 6. VkSampler                  ─── NEAREST, CLAMP_TO_EDGE（graphics pass 采样 storage image）
+ 7. 创建 compute descriptor set layout（binding 0=CameraUBO, 1=SpacetimeUBO, 2=StorageImage）
+ 8. 创建 graphics descriptor set layout（binding 0=CombinedImageSampler）
+ 9. 创建 compute pipeline layout + graphics pipeline layout
+10. ComputePipeline            ─── geodesic_minimal.comp.spv
+11. GraphicsPipeline           ─── fullscreen.vert.spv + fullscreen.frag.spv（Dynamic Rendering, 传 swapchain format）
+12. VkDescriptorPool (VulkanApp 自有) + 分配/更新 compute + graphics descriptor sets
+13. 创建 sync objects：3 组 image_available semaphore + frame_fence（VK_FENCE_CREATE_SIGNALED_BIT，首帧直接通过）
+    + render_finished semaphores（每 swapchain image 一个）+ images_in_flight_
 ```
 
 ## 析构顺序
@@ -747,7 +783,14 @@ blackhole_prac/
 └── shaders/
     ├── fullscreen.vert
     ├── fullscreen.frag
-    └── geodesic.comp
+    ├── geodesic_minimal.comp       # 运行时 compute shader（Kerr 度规测地线积分）
+    ├── geodesic.comp.old           # 旧版占位 shader（已弃用，保留作参考）
+    ├── ks_block1_radius.comp       # 实验: 半径/视界判定块
+    ├── ks_block2_metric.comp       # 实验: 度规计算块
+    ├── ks_block3_christoffel.comp  # 实验: Christoffel 符号块
+    ├── ks_block4_tracer.comp       # 实验: 光线追踪积分块
+    ├── shader_base.vert / .frag    # Stage 3 基础管线测试用
+    └── shader_ubo.vert / .frag     # Stage 3 UBO 管线测试用
 ```
 
 ---
@@ -812,5 +855,6 @@ blackhole_prac/
 | 2026-06-03 v3 | 名词类 context 指针统一 + 职责边界修正 | GPUBuffer/GPUImage 统一持有 `const VulkanContext*` 替代裸 `VkDevice`，砍掉 GPUBuffer 的 `upload_from_host`（越界），VulkanContext 构造函数内置窗口创建 |
 | 2026-06-04 v4 | 同步模型补全 + 接口精确化 | 新增 frame fence（CPU/GPU 帧同步），补全 swapchain image barrier（渲染前后各一次），barrier 接口升级到 synchronization2，queue family index 拆分为三个独立 getter，GPUImage 布局更新改为显式两步（create_barrier + set_layout），VulkanContext 明确 GLFW window 所有权，UBO 改为具名成员，预留 recreate_swapchain 接口 |
 | 2026-06-05 v5 | Stage 4+5 实现 + triple-buffering | CommandBuffer 全部方法实现（begin/end, bind_pipeline, bind_descriptor_sets, dispatch, begin_rendering/end_rendering, draw, pipeline_barrier2 等）。VulkanApp 完整实现：构造链（VulkanContext → UBO → GPUImage → VkSampler → descriptor set layouts → pipeline layouts → pipelines → descriptor pool → descriptor sets → sync objects），triple-buffered 帧循环（MAX_FRAMES_IN_FLIGHT=3, images_in_flight_ 追踪），每帧三阶段管线（compute barrier → dispatch → graphics barrier → swapchain barrier → begin_rendering → draw → end_rendering → swapchain barrier → submit → present）。VulkanContext 新增 `swapchain_image()` getter，`allocate_command_buffer` / `reset_command_pool` 改为按 frame_index 操作。vulkan_util 新增 `create_descriptor_pool` |
+| 2026-06-08 v6 | FPV Camera + UBO 实际数据 + shader 管线重构 + 同步修复 | **FPV Camera**：新增 `FPCamera` 结构体（position + yaw/pitch/fov），WASD 移动 + 鼠标左键环视 + 滚轮缩放，通过 GLFW static 回调 + `glfwSetWindowUserPointer` 回找 VulkanApp 实例。**UBO 数据**：`update_ubos()` 从 memset 占位改为实际填充——CameraUBO 96B（camPos + invViewProj + stepSize + maxSteps + escapeRadius），SpacetimeUBO 48B（bhParams M/a/horizon + integratorParams + diskParams）。**Shader 管线**：compute shader 从 `geodesic.comp`（简化牛顿引力透镜）切换到 `geodesic_minimal.comp`（完整 Kerr 度规 Christoffel 实时计算），旧版重命名为 `.old` 保留作参考；新增 `ks_block1~4` 实验分块 shader（半径判定 / 度规 / Christoffel / 追踪）。**CMake shader 自动发现**：从硬编码 `compile_shader()` 改为 `file(GLOB)` 自动发现 `shaders/*.comp|.vert|.frag`，排除 `ks_block_*` 和 `.old`。**同步修复**：`render_finished_semaphores_` 从 `VkSemaphore[MAX_FRAMES_IN_FLIGHT]`（per-in-flight-frame）改为 `std::vector<VkSemaphore>`（per-swapchain-image），解决 current_frame_ 回绕时 presentation engine 异步持有旧 semaphore 的复用竞态。VulkanContext debug 模式新增物理设备名输出 |
 
-当前版本：**v5**（2026-06-05）
+当前版本：**v6**（2026-06-08）

@@ -1,0 +1,153 @@
+// ══════════════════════════════════════════════════════════════
+// 第四块：完整追踪 —— Kerr-Schild 笛卡尔坐标
+// ══════════════════════════════════════════════════════════════
+//
+// 依赖前三块（必须已在同一文件中、且验证通过）：
+//   kerrRadius(p, a2)
+//   kerrSchildScalars(p, M, a, a2, out f, out l)
+//   metric_dn(mu, nu, f, l) / metric_up(mu, nu, f, l)
+//   geodesicRHS_KS(pos, mom, M, a, a2, out dPos, out dMom)
+//   rk4Step_KS(pos, mom, h, M, a, a2)
+//
+// 坐标：pos = (t, x, y, z)，mom = p^μ = (p^t, p^x, p^y, p^z)
+// 黑洞在原点，自转轴 = z 轴，赤道面 = z=0 平面。
+// ══════════════════════════════════════════════════════════════
+
+// ── 背景天空（直接用笛卡尔方向，不再需要 blToCartesian）──
+vec3 sampleBackground(vec3 dir) {
+    vec3 d = normalize(dir);
+    float galaxy = exp(-abs(d.z) * 6.0) * 0.12;   // 注意：用 d.z（自转轴），银河带绕赤道
+    vec3 bg = vec3(galaxy * 0.3, galaxy * 0.4, galaxy * 0.7);
+    vec3 sd = floor(d * 250.0);
+    float hsh = fract(sin(dot(sd, vec3(127.1, 311.7, 74.3))) * 43758.5453);
+    float star = step(0.9975, hsh);
+    bg += vec3(0.7, 0.8, 1.0) * star * (0.3 + 0.7 * fract(hsh * 83.27));
+    return bg;
+}
+
+// ── 吸积盘着色（按半径冷暖渐变）──
+vec3 diskColor(float r, float diskInner, float diskOuter) {
+    float t = clamp((r - diskInner) / max(diskOuter - diskInner, 0.01), 0.0, 1.0);
+    vec3 inner = vec3(1.0, 0.95, 0.85);   // 内盘热，近白
+    vec3 outer = vec3(1.0, 0.45, 0.15);   // 外盘冷，橙红
+    float bright = 0.4 + 0.8 * (1.0 - t); // 内盘更亮
+    return bright * mix(inner, outer, t);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 类光初始动量：给定相机位置和空间方向，解 p^t 使光子 null
+//   g_tt (p^t)² + 2 g_ti p^t dir^i + g_ij dir^i dir^j = 0
+// ══════════════════════════════════════════════════════════════
+
+vec4 makeNullMomentum(vec3 camPos, vec3 dir, float M, float a, float a2) {
+    float f; vec4 l;
+    kerrSchildScalars(camPos, M, a, a2, f, l);
+
+    float g_tt = metric_dn(0, 0, f, l);
+    float B = 0.0, C = 0.0;
+    for (int i = 1; i < 4; i++) {
+        B += 2.0 * metric_dn(0, i, f, l) * dir[i-1];
+        for (int j = 1; j < 4; j++) {
+            C += metric_dn(i, j, f, l) * dir[i-1] * dir[j-1];
+        }
+    }
+    float disc = max(B*B - 4.0*g_tt*C, 0.0);
+    float sq = sqrt(disc);
+    // 取"未来指向"的根：p^t > 0
+    float pt = (-B - sq) / (2.0 * g_tt);
+    if (pt < 0.0) pt = (-B + sq) / (2.0 * g_tt);
+
+    return vec4(pt, dir);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 主追踪：固定步长 RK4，z=0 穿越检测盘面，椭球 r 判视界
+// ══════════════════════════════════════════════════════════════
+
+vec4 tracePhotonKS(vec3 camPos, vec3 dir,
+                   float M, float a, float a2,
+                   float horizonR, float escapeR,
+                   float diskInner, float diskOuter,
+                   float baseH, int maxSteps) {
+    vec4 pos = vec4(0.0, camPos);
+    vec4 mom = makeNullMomentum(camPos, dir, M, a, a2);
+
+    float prevZ = pos.w;   // 上一步的 z，用于赤道面穿越检测
+
+    for (int i = 0; i < maxSteps; i++) {
+        vec3 p = pos.yzw;
+        float r = kerrRadius(p, a2);
+
+        // ── 捕获：椭球 r 进入视界 ──
+        if (r < horizonR * 1.01) {
+            return vec4(0.0, 0.0, 0.0, 1.0);
+        }
+
+        // ── 逃逸：远场（用普通距离判，够远就出去）──
+        if (length(p) > escapeR) {
+            return vec4(sampleBackground(dir), 1.0);
+        }
+
+        // ── 步长：靠近视界变小，远场放大（用椭球 r）──
+        float ratio = max(r / horizonR, 1.0);
+        float scale = clamp(pow(ratio, 0.5), 0.08, 8.0);
+        float h = baseH * scale;
+
+        // 记录步进前的 z
+        prevZ = pos.w;
+        rk4Step_KS(pos, mom, h, M, a, a2);
+
+        // ── 盘面：检测 z 是否跨过 0（赤道面）──
+        if (prevZ * pos.w < 0.0) {
+            // 线性插值出穿越点的半径（更准）
+            float frac = prevZ / (prevZ - pos.w);  // ∈ [0,1]
+            vec3 cross = mix(vec3(0.0) + vec3(0.0), pos.yzw, 1.0); // 占位
+            // 用步进前后插值穿越点（pos 已是步后，prevZ 是步前 z）
+            // 近似：穿越点 xy 用步后位置即可（薄盘，误差小）
+            float rCross = kerrRadius(pos.yzw, a2);
+            if (rCross >= diskInner && rCross <= diskOuter) {
+                return vec4(diskColor(rCross, diskInner, diskOuter), 1.0);
+            }
+        }
+    }
+
+    // 超步数 —— 调试期用品红，定位"没跑完"的像素
+    return vec4(1.0, 0.0, 1.0, 1.0);
+}
+
+// ══════════════════════════════════════════════════════════════
+// 主入口
+// ══════════════════════════════════════════════════════════════
+
+void main() {
+    ivec2 pix  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outImage);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    float M  = spacetime.bhParams.x;
+    float a  = spacetime.bhParams.y;
+    float a2 = a * a;
+
+    // 视界半径（外视界）r_h = M + √(M² − a²)
+    float horizonR = M + sqrt(max(M*M - a2, 0.0));
+
+    float diskInner = spacetime.diskParams.x;
+    float diskOuter = spacetime.diskParams.y;
+
+    // ── 相机：Kerr-Schild 笛卡尔坐标 ──
+    // 注意：C++ 的 cam.camPos 现在应是笛卡尔 (x,y,z,_)，不再是 BL (r,θ,φ)
+    vec3 camPos = cam.camPos.xyz;
+
+    // NDC → 笛卡尔世界方向
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec4 wd4 = cam.invViewProj * vec4(uv, 1.0, 1.0);
+    vec3 dir = normalize(wd4.xyz / wd4.w - camPos);
+
+    vec4 color = tracePhotonKS(camPos, dir,
+                               M, a, a2,
+                               horizonR, cam.escapeRadius,
+                               diskInner, diskOuter,
+                               cam.stepSize, cam.maxSteps);
+
+    imageStore(outImage, pix, color);
+}
